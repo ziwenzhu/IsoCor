@@ -4,6 +4,7 @@ import isocor.ui.isocordb
 import pandas as pd
 import numpy as np
 import io
+import math
 import logging
 from pathlib import Path
 import sys
@@ -48,7 +49,7 @@ def process(args):
                 "Can't find tracer named '{}'. Eventually check the case in your Isotopes file".format(tracer))
         tracer_purity = getattr(args, 'tracer_purity', None)
         if tracer_purity:
-            if any(i < 0 for i in tracer_purity) or any(i > 1 for i in tracer_purity) or sum(tracer_purity) != 1:
+            if any(i < 0 for i in tracer_purity) or any(i > 1 for i in tracer_purity) or not math.isclose(math.fsum(tracer_purity), 1, abs_tol=hr.LowResMetaboliteCorrector.SUM_TOLERANCE):
                 raise ValueError(
                     "Purity values ({}) should be within the range [0, 1], and their sum should be 1.".format(tracer_purity))
         correct_NA_tracer = True if hasattr(

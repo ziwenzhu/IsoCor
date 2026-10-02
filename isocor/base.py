@@ -68,12 +68,16 @@ class LabelledChemical(object):
                        "Si": {"abundance": [0.92223, 0.04685, 0.03092],
                               "mass": [D('27.976926535'), D('28.976494665'), D('29.9737701')]}}
 
-    def __init__(self, formula, tracer, derivative_formula, tracer_purity,
-                 correct_NA_tracer, data_isotopes, charge=None, label=None, inchi=None):
+    # Absolute tolerance used to check that probability vectors sum to 1
+    SUM_TOLERANCE = 1e-9
+
+    def __init__(self, formula, tracer, derivative_formula=None, tracer_purity=None,
+                 correct_NA_tracer=False, data_isotopes=None, charge=None, label=None, inchi=None):
         """Initialize a new LabelledChemical with its associated data."""
         # Load data_isotope first as it is critical for the other attributes
-        self._data_isotopes = self.DEFAULT_ISODATA if data_isotopes is None else data_isotopes
-        self._check_data_isotopes(self._data_isotopes)
+        data_isotopes = self.DEFAULT_ISODATA if data_isotopes is None else data_isotopes
+        self._check_data_isotopes(data_isotopes)
+        self._data_isotopes = self._masses_to_decimal(data_isotopes)
         # Pseudo-private attributes (mostly to work with properties)
         self._molecular_weight = None
         self._tracer_purity = tracer_purity
@@ -92,7 +96,7 @@ class LabelledChemical(object):
             if self._charge == 0:
                 raise ValueError(
                     "'charge' parameter should not be 0 ({})".format(charge))
-        except:
+        except (TypeError, ValueError):
             raise ValueError("'charge' parameter should be a non-null integer ({})".format(charge))
         # Protected attributes (user should not see them, but must stay available in sub-class)
         self._tracer_el, self._idx_tracer = self._parse_strtracer(
@@ -106,8 +110,17 @@ class LabelledChemical(object):
         # NB: in the future those checks should be in the setters
         if len(self.data_isotopes[self._tracer_el]["mass"]) != len(self.tracer_purity):
             raise ValueError("Unexpected length of tracer purity vector.")
+        if any(not (0. <= p <= 1.) for p in self.tracer_purity):
+            raise ValueError("Tracer purity values should be within the range [0, 1]"
+                             " ({}).".format(self.tracer_purity))
+        if not math.isclose(math.fsum(self.tracer_purity), 1., abs_tol=self.SUM_TOLERANCE):
+            raise ValueError("Tracer purity values should sum to 1"
+                             " ({}).".format(self.tracer_purity))
         if not self.formula:
             raise ValueError("The elemental formula ({}) is empty.".format(self.label))
+        for element in list(self.formula) + list(self.derivative_formula):
+            if element not in self.data_isotopes:
+                raise ValueError("No isotopic data for element '{}' in {}.".format(element, self.label))
         if self._tracer_el not in self.formula:
             raise ValueError("The isotopic tracer ({}) must be present in the"
                              " metabolite {}.".format(self._tracer_el, self._str_formula))
@@ -264,6 +277,11 @@ class LabelledChemical(object):
         """
         if str_formula is None:
             return None
+        str_formula = re.sub(r'\s', '', str_formula)
+        if not re.fullmatch(r'([A-Z][a-z]*\d*)*', str_formula):
+            raise ValueError("Invalid elemental formula: '{}'. Use element symbols followed by"
+                             " their counts (e.g. 'C3H7O6P'), without parentheses, charges"
+                             " or decimal numbers.".format(str_formula))
         pformula = re.findall(r'([A-Z][a-z]*)(\d*)', str_formula)
         counter = collections.Counter()
         for element, cnt in pformula:
@@ -304,6 +322,16 @@ class LabelledChemical(object):
         return (tracer_el, idx_tracer)
 
     @staticmethod
+    def _masses_to_decimal(data_isotopes):
+        """Return a copy of :py:attr:`~data_isotopes` with all masses as Decimal.
+
+        Masses are summed and compared exactly at high resolution, which requires Decimal.
+        """
+        return {element: dict(data_el, mass=[m if isinstance(m, D) else D(str(m))
+                                             for m in data_el["mass"]])
+                for element, data_el in data_isotopes.items()}
+
+    @staticmethod
     def _check_data_isotopes(data_isotopes):
         """Check :py:attr:`~data_isotopes` validity
 
@@ -336,7 +364,8 @@ class LabelledChemical(object):
                                      " data_isotopes for element {}.".format(element))
                 previous_mass = mass
             # Abundance specific checks
-            if math.fsum(data_el["abundance"]) != 1.:
+            if not math.isclose(math.fsum(data_el["abundance"]), 1.,
+                                abs_tol=LabelledChemical.SUM_TOLERANCE):
                 raise ValueError("The sum of the natural abundance of each isotope"
                                  " should ALWAYS equal 1."
                                  " This is not the case for {}.".format(element))

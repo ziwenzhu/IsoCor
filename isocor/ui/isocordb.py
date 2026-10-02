@@ -51,7 +51,7 @@ class EnvComputing(object):
         return d
 
     def _stripColNames(self, df):
-        df.rename(columns=lambda x: x.strip())
+        df.rename(columns=lambda x: x.strip(), inplace=True)
 
     def _stripCol(self, df, listcolumns):
         for col in listcolumns:
@@ -64,6 +64,7 @@ class EnvComputing(object):
         try:
             with open(str(isotopesfile), 'r', encoding='utf-8') as fp:  # str for compatibility with Python3.5
                 self.dfIsotopes = pd.read_csv(fp, na_values=[''])
+            self._stripColNames(self.dfIsotopes)
         except Exception as err:
             raise ValueError("An unknown error has occurred opening the isotopes database ('{}').\n\nPlease check this file (details on the expected format can be found in the documentation), correct the issue and rerun IsoCor.\n\nTraceback for debugging:\n{}".format(isotopesfile, err))
         for i in ['element', 'mass', 'abundance']:
@@ -107,6 +108,7 @@ class EnvComputing(object):
         try:
             with open(str(derivativesfile), 'r', encoding='utf-8') as fp:
                 self.dfDerivatives = pd.read_csv(fp, delimiter='\t')
+            self._stripColNames(self.dfDerivatives)
         except Exception as err:
             raise ValueError("An unknown error has occurred opening the derivatives database ('{}').\n\nPlease check this file (details on the expected format can be found in the documentation) and correct the issue.\n\nTraceback for debugging:\n{}".format(derivativesfile, err))
         for i in ['name', 'formula']:
@@ -122,6 +124,7 @@ class EnvComputing(object):
         try:
             with open(str(metabolitesfile), 'r', encoding='utf-8') as fp:
                 self.dfMetabolites = pd.read_csv(fp, delimiter='\t', converters={'charge': str, 'inchi': str})
+            self._stripColNames(self.dfMetabolites)
         except Exception as err:
             raise ValueError("An unknown error has occurred opening the metabolites database ('{}').\n\nPlease check this file (details on the expected format can be found in the documentation) and correct the issue.\n\nTraceback for debugging:\n{}".format(metabolitesfile, err))
         for i in ['name', 'formula', 'charge']:
@@ -139,6 +142,7 @@ class EnvComputing(object):
         try:
             with open(str(datafile), 'r', encoding='utf-8') as fp:
                 self.dfDatafile = pd.read_csv(fp, delimiter='\t', keep_default_na=False)
+            self._stripColNames(self.dfDatafile)
         except Exception as err:
             raise ValueError("An unknown error has occurred opening the measurements file ('{}').\n\nPlease check this file (details on the expected format can be found in the documentation) and correct the issue.\n\nTraceback for debugging:\n{}".format(datafile, err))
         tocheck = ['sample', 'metabolite', 'derivative', 'area', 'isotopologue']
@@ -171,7 +175,7 @@ class EnvComputing(object):
                     raise ValueError("Error in measurements file ('{}') at line {}:\nresolution={!r}".format(datafile, i+2, item))
             self.dfDatafile[['resolution']] = self.dfDatafile[['resolution']].astype(str)
 
-        self.dfDatafile['derivative'].fillna('', inplace=True)
+        self.dfDatafile['derivative'] = self.dfDatafile['derivative'].fillna('')
         if self.dfDatafile.empty:
             raise ValueError("Measurements file ('{}') is empty.".format(datafile))
         self._stripColNames(self.dfDatafile)

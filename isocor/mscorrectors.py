@@ -50,6 +50,9 @@ class MetaboliteCorrectorFactory(object):
         resolution_formula_code (str): code for the resolution formula you wish to use to compute
             the correction limit among the presets: "orbitrap" (default), "ft-icr", and "constant".
             This formula depends on your mass spectrometer.
+        resolution_formula (func): (EXPERIMENTAL) function returning the correction limit,
+            used instead of :attr:`~resolution_formula_code` (see
+            :py:class:`~HighResMetaboliteCorrector`).
         charge (int): charge state of the metabolite (e.g. "-2").
 
     Raises:
@@ -70,6 +73,7 @@ class MetaboliteCorrectorFactory(object):
         charge = kwargs.pop("charge", None)
         mz_of_resolution = kwargs.pop("mz_of_resolution", None)
         resolution_formula_code = kwargs.pop("resolution_formula_code", "orbitrap")
+        resolution_formula = kwargs.pop("resolution_formula", None)
         # Choose a corrector
         if resolution is None and mz_of_resolution is None:
             logger.debug("MetaboliteCorrectorFactory chose to use a"
@@ -91,8 +95,9 @@ class MetaboliteCorrectorFactory(object):
                                                        tracer_purity=tracer_purity,
                                                        correct_NA_tracer=correct_NA_tracer,
                                                        resolution_formula_code=resolution_formula_code,
+                                                       resolution_formula=resolution_formula,
                                                        charge=charge,
-                                                      inchi=inchi)
+                                                       inchi=inchi)
             except InterfaceMSCorrector.ImproperUsageError as reason:
                 logger.warning("Improper usage of HighResMetaboliteCorrector "
                                "by MetaboliteCorrectorFactory."
@@ -189,6 +194,9 @@ class LowResMetaboliteCorrector(LabelledChemical, InterfaceMSCorrector):
                              " (i.e. N + 1, where N is the number of atoms that could"
                              " be traced)".format(len(measurement),
                                                   self.formula[self._tracer_el] + 1))
+        if not np.all(np.isfinite(np.asarray(measurement, dtype=float))):
+            raise ValueError("The measured isotopic cluster contains missing or non-finite"
+                             " values: {}".format(measurement))
         # Perform the actual correction
         corrected_area, iso_fraction, residuum, enrichment = self._correct_with_bfgs(
             measurement)
@@ -296,8 +304,8 @@ class LowResMetaboliteCorrector(LabelledChemical, InterfaceMSCorrector):
                 for _ in range(n_isotopologues-i-1):
                     column = np.convolve(
                         column, self.data_isotopes[self._tracer_el]["abundance"])
-            if len(column) < max(mask)+1:
-                column += [0.]*(max(mask)-len(column)+1)
+            # Pad with zeros (without modifying correction_vector in place)
+            column = list(column) + [0.]*max(0, max(mask)+1-len(column))
             column = [column[j] for j in mask]
             correction_matrix[:, i] = column
         logger.debug("Done computing correction matrix (convolution) for %s: %s",
@@ -369,6 +377,7 @@ class HighResMetaboliteCorrector(LowResMetaboliteCorrector):
     }
 
     def __init__(self, formula, tracer, resolution, mz_of_resolution, resolution_formula_code, charge, **kwargs):
+        resolution_formula = kwargs.pop("resolution_formula", None)
         LowResMetaboliteCorrector.__init__(self, formula, tracer, charge=charge, **kwargs)
         # Some checks on the inputs
         try:
@@ -383,13 +392,13 @@ class HighResMetaboliteCorrector(LowResMetaboliteCorrector):
         if mz_of_resolution <= 0.:
             raise ValueError(
                 "'mz_of_resolution' parameter should be >0 ({})".format(mz_of_resolution))
-        try:
-            resolution_formula = kwargs.get("resolution_formula",
-                                            self.RES_FORMULAS[resolution_formula_code])
-        except KeyError:
-            raise NotImplementedError("No resolution formula registered for code '{}'. "
-                                      "Please provide the formula as resolution_formula"
-                                      "parameter.".format(resolution_formula_code))
+        if resolution_formula is None:
+            try:
+                resolution_formula = self.RES_FORMULAS[resolution_formula_code]
+            except KeyError:
+                raise NotImplementedError("No resolution formula registered for code '{}'. "
+                                          "Please provide the formula as resolution_formula "
+                                          "parameter.".format(resolution_formula_code))
         # Check correction limit
         self._correction_limit = resolution_formula(float(self.molecular_weight)/self.charge, resolution, mz_of_resolution) * self.charge
         self.threshold_p = None if self.molecular_weight < 500 else 1e-10
@@ -426,7 +435,7 @@ class HighResMetaboliteCorrector(LowResMetaboliteCorrector):
         dem = 1
         for x in set(isoblock):
             dem *= math.factorial(isoblock.count(x))
-        return int(math.factorial(len(isoblock)) / dem)
+        return math.factorial(len(isoblock)) // dem
 
     def _get_block_1(self, mass, n_atoms):
         return [(mass * n_atoms, 1.0)]
@@ -485,9 +494,8 @@ class HighResMetaboliteCorrector(LowResMetaboliteCorrector):
             assert all([x[1] >= 0 for x in data[element]]
                        ), "Unexpected negative probability."
             if self.threshold_p is not None:
-                for peak in data[element]:
-                    if peak[1] <= self.threshold_p:  # abundance
-                        del peak
+                data[element] = [peak for peak in data[element]
+                                 if peak[1] > self.threshold_p]  # abundance
         return data
 
     def _combine_blocks(self, groups):

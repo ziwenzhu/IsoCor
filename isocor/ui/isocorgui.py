@@ -10,6 +10,7 @@ import isocor as hr
 from pathlib import Path
 import numpy as np
 import re
+import math
 import webbrowser
 import threading
 import urllib
@@ -277,7 +278,7 @@ class GUIinterface(ttk.Frame):
         # check critical parameters and cancel processing if errors
         try:
             tracer_purity = [float(i.get()) for i in self.purityManager.tracer_purity]
-            if any(i < 0 for i in tracer_purity) or any(i > 1 for i in tracer_purity) or sum(tracer_purity) != 1:
+            if any(i < 0 for i in tracer_purity) or any(i > 1 for i in tracer_purity) or not math.isclose(math.fsum(tracer_purity), 1, abs_tol=hr.LowResMetaboliteCorrector.SUM_TOLERANCE):
                 self.stop_process()
                 messagebox.showerror("Error",
                                      "Purity values should be within the range [0, 1], and their sum should be 1.")
