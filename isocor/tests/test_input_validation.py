@@ -20,7 +20,8 @@ def test_invalid_tracer_purity(purity):
 def test_tracer_purity_float_rounding():
     """A purity that sums to 1 up to floating point errors is accepted."""
     purity = [0.6, 0.3, 0.1]
-    assert sum(purity) != 1.
+    # plain addition (sum() is compensated since Python 3.12)
+    assert purity[0] + purity[1] + purity[2] != 1.
     hrcor.MetaboliteCorrectorFactory("C3H7O6P", "18O", tracer_purity=purity)
 
 

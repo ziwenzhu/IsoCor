@@ -1,7 +1,6 @@
 import argparse
 import isocor as hr
 import isocor.ui.isocordb
-import pandas as pd
 import numpy as np
 import io
 import math
@@ -154,7 +153,7 @@ def process(args):
     logger.info('------------------------------------------------')
     logger.info('Correcting raw MS data...')
     logger.info('------------------------------------------------')
-    df = pd.DataFrame()
+    rows, index = [], []
     for label in labels:
         metabo = dictMetabolites[label]
         series, series_err = baseenv.getDataSerie(label, useformula)
@@ -185,8 +184,9 @@ def process(args):
                 logger.error(
                     "{} - {}: (metabolite, derivative) corrector could not be constructed.".format(serie[0], label))
             for i, line in enumerate(zip(*(serie[1], valuesCorrected[0], valuesCorrected[1], valuesCorrected[2], [valuesCorrected[3]]*len(valuesCorrected[0])))):
-                df = pd.concat((df, pd.DataFrame([line], index=pd.MultiIndex.from_tuples([[serie[0], label[0], label[1], i, isotopic_inchi[i]]], names=[
-                    'sample', 'metabolite', 'derivative', 'isotopologue', 'isotopic_inchi']), columns=['area', 'corrected_area', 'isotopologue_fraction', 'residuum', 'mean_enrichment'])))
+                rows.append(line)
+                index.append((serie[0], label[0], label[1], i, isotopic_inchi[i]))
+    df = isocor.ui.isocordb.results_dataframe(rows, index)
 
     # summary results for logs
     logger.info('------------------------------------------------')

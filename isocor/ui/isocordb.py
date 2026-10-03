@@ -259,3 +259,12 @@ class EnvComputing(object):
                 except:
                     l_err.append(i[length])
         return l, l_err
+
+
+def results_dataframe(rows, index):
+    """Return the table of results from its rows and index tuples."""
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows, index=pd.MultiIndex.from_tuples(index, names=[
+        'sample', 'metabolite', 'derivative', 'isotopologue', 'isotopic_inchi']),
+                        columns=['area', 'corrected_area', 'isotopologue_fraction', 'residuum', 'mean_enrichment'])

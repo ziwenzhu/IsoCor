@@ -1,9 +1,10 @@
 import tkinter as tk
 from tkinter import ttk
+from tkinter import font as tkfont
 from tkinter import scrolledtext
 from tkinter import filedialog
 from tkinter import messagebox
-from isocor.ui.isocordb import EnvComputing
+from isocor.ui.isocordb import EnvComputing, results_dataframe
 import logging
 import pandas as pd
 import isocor as hr
@@ -11,12 +12,17 @@ from pathlib import Path
 import numpy as np
 import re
 import math
+import queue
 import webbrowser
 import threading
-import urllib
+import urllib.request
 
 UTF8_TABLE_SUBCRIPS_INT = {'0': '\u2070', '1': '\u00B9', '2': '\u00B2', '3': '\u00B3',
                            '4': '\u2074', '5': '\u2075', '6': '\u2076', '7': '\u2077', '8': '\u2078', '9': '\u2079'}
+
+# m/z passed to the correctors when the resolution formula does not use it
+# ('constant' and 'datafile' formulas); the factory requires a positive value.
+UNUSED_MZ_OF_RESOLUTION = 400.0
 
 
 class Tooltip:
@@ -167,67 +173,125 @@ class Tooltip:
         self.tw = None
 
 
+class ProcessCancelled(Exception):
+    """Raised in the worker thread when the user stops the correction process."""
+    pass
+
+
 class TextHandler(logging.Handler):
-    """This class allows you to log to a Tkinter Text or ScrolledText widget"""
+    """This class allows you to log to a Tkinter Text or ScrolledText widget
+
+    Records may be emitted from any thread: they are queued, and written to the widget
+    by :py:meth:`~flush_to_widget`, which must be called from the Tk main loop
+    (Tk widgets must only be used from the main thread).
+    """
 
     def __init__(self, text):
         # run the regular Handler __init__
         logging.Handler.__init__(self)
         # Store a reference to the Text it will log to
         self.text = text
+        self.queue = queue.Queue()
 
     def emit(self, record):
-        msg = self.format(record)
+        self.queue.put(self.format(record))
 
-        def append():
+    def flush_to_widget(self):
+        """Write the queued messages to the widget."""
+        lines = []
+        while True:
+            try:
+                lines.append(self.queue.get_nowait())
+            except queue.Empty:
+                break
+        if lines:
             self.text.configure(state='normal')
-            self.text.insert(tk.END, msg + '\n')
+            self.text.insert(tk.END, '\n'.join(lines) + '\n')
             self.text.configure(state='disabled')
             # Autoscroll to the bottom
             self.text.yview(tk.END)
-
-        # This is necessary because we can't modify the Text from other threads
-        self.text.after(0, append)
 
 
 class PurityTracerManager(tk.Canvas):
     def __init__(self, master=None, **kwargs):
         tk.Canvas.__init__(self, master, **kwargs)
-        #  self._initFrameInWindows()
         self.tracer_purity = []
+        self.isotope_names = []
+        self._entries = []
+        self._bind_wheel(self)
 
     def _initFrameInWindows(self):
         self.frame = ttk.Frame(self)
         self.create_window((0, 0), anchor="nw", window=self.frame)
+        self._bind_wheel(self.frame)
+
+    def _bind_wheel(self, widget):
+        """Scroll the entries with the mouse wheel (Windows/macOS and X11 events)."""
+        for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(event, self._on_wheel)
+
+    def _on_wheel(self, event):
+        if event.num == 4 or getattr(event, 'delta', 0) > 0:
+            self.yview_scroll(-1, "units")
+        else:
+            self.yview_scroll(1, "units")
+
+    def show_entry(self, index):
+        """Scroll the canvas so that the entry at the given index is visible."""
+        self.update_idletasks()
+        total_height = self.frame.winfo_reqheight()
+        if not self._entries or total_height <= 0:
+            return
+        entry = self._entries[index]
+        top, bottom = entry.winfo_y(), entry.winfo_y() + entry.winfo_reqheight()
+        # before the window is shown, use the requested height of the canvas
+        view_height = self.winfo_height() if self.winfo_ismapped() else int(self.cget('height'))
+        view_top = self.canvasy(0)
+        if top < view_top:
+            self.yview_moveto(top / total_height)
+        elif bottom > view_top + view_height:
+            self.yview_moveto((bottom - view_height) / total_height)
 
     def changeEntries(self, df, tracer):
-        row = 0
         self.tracer_purity = []
+        self.isotope_names = []
+        self._entries = []
         # canvas clear all method
         self.delete("all")
         self._initFrameInWindows()
         purity = (df['subscriptName'] ==
                   tracer.iloc[0]['subscriptName']).astype(int)
-        for entry in df.itertuples():
+        tracer_row = 0
+        for row, entry in enumerate(df.itertuples()):
             purityentry = tk.StringVar()
             purityentry.set(str(purity[entry.Index]))
-            label_entry = ttk.Label(
-                self.frame, text=entry.subscriptName).grid(row=row, column=0, sticky="news")
-            purity_entry = ttk.Entry(
-                self.frame, textvariable=purityentry).grid(row=row, column=1, sticky="news")
+            label_entry = ttk.Label(self.frame, text=entry.subscriptName)
+            label_entry.grid(row=row, column=0, sticky="news")
+            purity_entry = ttk.Entry(self.frame, textvariable=purityentry)
+            purity_entry.grid(row=row, column=1, sticky="news")
+            # keep the entry visible when it is reached with the keyboard
+            purity_entry.bind("<FocusIn>", lambda event, i=row: self.show_entry(i))
+            self._bind_wheel(label_entry)
+            self._bind_wheel(purity_entry)
             self.tracer_purity.append(purityentry)
-            row += 1
-        self.create_window((0, 0), anchor="nw", window=self.frame)
+            self.isotope_names.append(entry.subscriptName)
+            self._entries.append(purity_entry)
+            if purity[entry.Index]:
+                tracer_row = row
         self.frame.update_idletasks()
+        self.config(scrollregion=self.bbox("all"))
+        self.yview_moveto(0)
+        # the entry of the tracer isotope must be visible
+        self.show_entry(tracer_row)
 
 
 class GUIinterface(ttk.Frame):
     """GUI interface for isocor in tk widget"""
 
-    def __init__(self, master=None):
+    def __init__(self, master=None, home=None):
         super().__init__(master)
-        self.pack()
-        self.baseenv = EnvComputing()
+        self.pack(fill='both', expand=True)
+        self.baseenv = EnvComputing() if home is None else EnvComputing(home)
         # check the database files exists in the default path,
         # otherwise copy them from the example folder
         self.baseenv.initializeDB()
@@ -237,25 +301,62 @@ class GUIinterface(ttk.Frame):
             self.baseenv.registerIsopotes(isotopesfile)
         except Exception as err:
             messagebox.showerror("Error", err)
-            quit()
+            raise SystemExit(1)
 
         self.addSubcriptingName()
         self.cleanListTracer()
         self.log_level = 'INFO'
         self.createWidgets()
-        self._thread, self._stop = None, True
+        # worker thread running the correction, event used to stop it, and its outcome
+        self._thread, self._stop_event, self._result = None, threading.Event(), None
+        self._poll()
 
     def start_process(self):
-        if self._thread is None:
-            self._stop = False
-            self._thread = threading.Thread(target=self.process)
-            self._thread.start()
+        """Check the parameters, then run the correction in a worker thread."""
+        if self._thread is not None:
+            return
+        params = self.getParameters()
+        if params is None:
+            return
+        self.cleanLog()
+        self._stop_event = threading.Event()
+        self._result = None
+        self._thread = threading.Thread(target=self._run_process, args=(params,), daemon=True)
+        self._thread.start()
         self.processButon.configure(text="Stop", command=self.stop_process)
 
     def stop_process(self):
+        """Ask the worker thread to stop as soon as possible."""
         if self._thread is not None:
-            self._thread, self._stop = None, True
-        self.processButon.configure(text="Process", command=self.start_process)
+            self._stop_event.set()
+            self.processButon.configure(text="Stopping...", state='disabled')
+
+    def _check_stop(self):
+        if self._stop_event.is_set():
+            raise ProcessCancelled()
+
+    def _run_process(self, params):
+        """Worker thread: run the correction and store its outcome (no Tk calls here)."""
+        try:
+            self._result = ('done', self.process(params))
+        except ProcessCancelled:
+            self.logger.warning("Process stopped by the user. No results were saved.")
+            self._result = ('cancelled', None)
+        except Exception as err:
+            self.logger.error("Process failed: {}".format(err))
+            self._result = ('error', str(err))
+
+    def _poll(self):
+        """Periodically display the logs and handle the end of the worker thread (main thread)."""
+        self.scroll_handler.flush_to_widget()
+        if self._thread is not None and not self._thread.is_alive():
+            self._thread = None
+            self.processButon.configure(text="Process", command=self.start_process, state='normal')
+            status, message = self._result if self._result else ('error', 'Unexpected error.')
+            if status == 'error':
+                messagebox.showerror("Error", "The correction process failed:\n\n{}\n\nSee the logs for details.".format(
+                    message))
+        self.after(100, self._poll)
 
     def addSubcriptingName(self):
         self.baseenv.dfIsotopes['subscriptName'] = self.baseenv.dfIsotopes['isotope'].apply(
@@ -264,223 +365,246 @@ class GUIinterface(ttk.Frame):
     def subscriptingInt(self, myint):
         return ''.join([UTF8_TABLE_SUBCRIPS_INT[i] for i in str(myint)])
 
-    def process(self):
-        "process Callback"
+    @staticmethod
+    def _positive_float(value):
+        """Return value as a positive float, or None if it is not a positive number."""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
 
-        # clean GUI logs frame
-        self.cleanLog()
+    def getParameters(self):
+        """Read and check the correction parameters (main thread).
 
-        # get correction parameters
-        tracer = self.baseenv.dfIsotopes[self.baseenv.dfIsotopes['subscriptName']
-                                         == self.isotopictracerCBB.get()]['name'].values[0]
-        correct_NA_tracer = self.chVarNatAbTracer.get()
-        data_isotopes = self.baseenv.dictIsotopes
+        Returns:
+            dict: correction parameters, or None if a parameter is invalid (an error is shown)
+        """
+        params = {}
+        params['tracer'] = self.baseenv.dfIsotopes[self.baseenv.dfIsotopes['subscriptName']
+                                                   == self.isotopictracerCBB.get()]['name'].values[0]
+        params['correct_NA_tracer'] = bool(self.chVarNatAbTracer.get())
+        params['data_isotopes'] = self.baseenv.dictIsotopes
         # check critical parameters and cancel processing if errors
-        try:
-            tracer_purity = [float(i.get()) for i in self.purityManager.tracer_purity]
-            if any(i < 0 for i in tracer_purity) or any(i > 1 for i in tracer_purity) or not math.isclose(math.fsum(tracer_purity), 1, abs_tol=hr.LowResMetaboliteCorrector.SUM_TOLERANCE):
-                self.stop_process()
-                messagebox.showerror("Error",
-                                     "Purity values should be within the range [0, 1], and their sum should be 1.")
-                return
-        except:
-            self.stop_process()
-            messagebox.showerror("Error", "Purity values should be within the range [0, 1], and their sum should be 1.")
-            return
-        if self.chVarHR.get():
-            resolution_formula_code = self.formulaEntered.get()
+        tracer_purity = []
+        for name, var in zip(self.purityManager.isotope_names, self.purityManager.tracer_purity):
             try:
-                resolution = float(self.varMass.get())
-                if resolution <= 0:
-                    self.stop_process()
+                value = float(var.get())
+            except ValueError:
+                value = None
+            if value is None or not (0 <= value <= 1):
+                messagebox.showerror("Error", "Invalid purity value for {}: '{}'.\n\nPurity values should be"
+                                              " numbers within the range [0, 1].".format(name, var.get()))
+                return None
+            tracer_purity.append(value)
+        if not math.isclose(math.fsum(tracer_purity), 1, abs_tol=hr.LowResMetaboliteCorrector.SUM_TOLERANCE):
+            messagebox.showerror("Error", "Purity values sum to {:g}, but their sum should be 1.".format(
+                math.fsum(tracer_purity)))
+            return None
+        params['tracer_purity'] = tracer_purity
+
+        params['HR'] = bool(self.chVarHR.get())
+        params['resolution_formula_code'] = self.formulaEntered.get() if params['HR'] else None
+        params['useformula'] = params['resolution_formula_code'] != 'datafile'
+        params['resolution'], params['mz_of_resolution'] = None, None
+        if params['HR']:
+            # only check the fields used by the selected formula (the others are disabled)
+            if params['useformula']:
+                params['resolution'] = self._positive_float(self.varMass.get())
+                if params['resolution'] is None:
                     messagebox.showerror("Error", "Resolution should be a positive number.")
-                    return
-            except:
-                self.stop_process()
-                messagebox.showerror("Error", "Resolution should be a positive number.")
-                return
-            try:
-                mz_of_resolution = float(self.varMZ.get())
-                if mz_of_resolution <= 0:
-                    self.stop_process()
+                    return None
+            if params['resolution_formula_code'] in ('constant', 'datafile'):
+                params['mz_of_resolution'] = UNUSED_MZ_OF_RESOLUTION
+            else:
+                params['mz_of_resolution'] = self._positive_float(self.varMZ.get())
+                if params['mz_of_resolution'] is None:
                     messagebox.showerror("Error", "mz at which resolution is measured should be a positive number.")
-                    return
-            except:
-                self.stop_process()
-                messagebox.showerror("Error", "mz at which resolution is measured should be a positive number.")
-                return
+                    return None
 
-        try:
-            derivativesfile = Path(self.varDatabasePath.get(), "Derivatives.dat")
-            self.baseenv.registerDerivativesDB(derivativesfile)
-        except Exception as err:
-            self.stop_process()
-            messagebox.showerror("Error", err)
-            return
-        try:
-            metabolitesfile = Path(self.varDatabasePath.get(), "Metabolites.dat")
-            self.baseenv.registerMetabolitesDB(metabolitesfile)
-        except Exception as err:
-            self.stop_process()
-            messagebox.showerror("Error", err)
-            return
-        if self.formulaEntered.get() == 'datafile':
-            useformula = False
-        else:
-            useformula = True
+        params['database_path'] = self.varDatabasePath.get()
+        params['input_file'] = self.varInputPath.get()
+        if not params['input_file'] or not Path(params['input_file']).is_file():
+            messagebox.showerror("Error", "Please load a measurements file first.")
+            return None
+        output_dir = Path(self.varOutputPath.get())
+        if not output_dir.is_dir():
+            messagebox.showerror("Error", "The output folder does not exist:\n'{}'.\n\nPlease select another"
+                                          " folder with 'Output Data Path'.".format(output_dir))
+            return None
+        fin_base = Path(params['input_file']).stem
+        params['out_file'] = output_dir.joinpath(fin_base + '_res.tsv')
+        params['log_file'] = output_dir.joinpath(fin_base + '.log')
+        if params['out_file'].exists():
+            overwrite = messagebox.askyesno(
+                "Overwrite results?",
+                "The results file already exists:\n'{}'.\n\nOverwrite it (and its log file)?".format(
+                    params['out_file']))
+            if not overwrite:
+                return None
+        params['log_level'] = self.log_level
+        return params
 
-        try:
-            input_file = self.varInputPath.get()
-            self.baseenv.registerDatafile(input_file, useformula)
-            fin_base = str(Path(input_file).stem)
-        except Exception as err:
-            self.stop_process()
-            messagebox.showerror("Error", err)
-            return
+    def process(self, params):
+        """Run the correction (worker thread): must not use any Tk widget.
+
+        Returns:
+            Path: the results file
+        """
+        derivativesfile = Path(params['database_path'], "Derivatives.dat")
+        self.baseenv.registerDerivativesDB(derivativesfile)
+        metabolitesfile = Path(params['database_path'], "Metabolites.dat")
+        self.baseenv.registerMetabolitesDB(metabolitesfile)
+        useformula = params['useformula']
+        input_file = params['input_file']
+        self.baseenv.registerDatafile(input_file, useformula)
+        tracer = params['tracer']
+        correct_NA_tracer = params['correct_NA_tracer']
+        tracer_purity = params['tracer_purity']
+        data_isotopes = params['data_isotopes']
+        resolution = params['resolution']
+        mz_of_resolution = params['mz_of_resolution']
+        resolution_formula_code = params['resolution_formula_code']
 
         # add a filehandler to the logger (to redirect logs to a file)
         formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s', "%Y-%m-%d %H:%M:%S")
-        log_file = Path(self.varOutputPath.get()).joinpath(fin_base + '.log')
+        log_file = params['log_file']
         file_handler = logging.FileHandler(str(log_file), mode='w+')
-        file_handler.setLevel(self.log_level)
+        file_handler.setLevel(params['log_level'])
         file_handler.setFormatter(formatter)
         self.logger.addHandler(file_handler)
+        try:
+            # log general information on the process
+            self.logger.info('------------------------------------------------')
+            self.logger.info("Correction process")
+            self.logger.info('------------------------------------------------')
+            self.logger.info("   data files")
+            self.logger.info("      data file: {}".format(input_file))
+            self.logger.info("      derivatives database: {}".format(derivativesfile))
+            self.logger.info("      metabolites database: {}".format(metabolitesfile))
+            self.logger.info("   correction parameters")
+            self.logger.info("      isotopic tracer: {}".format(tracer))
+            self.logger.info("      correct natural abundance of the tracer element: {}".format(correct_NA_tracer))
+            self.logger.info("      isotopic purity of the tracer: {}".format(tracer_purity))
+            if params['HR']:
+                self.logger.info("      mode: high-resolution")
+                self.logger.info("         formula code: {}".format(resolution_formula_code))
+                if useformula:
+                    self.logger.info("         instrument resolution: {}".format(resolution))
+                if resolution_formula_code not in ['datafile', 'constant']:
+                    self.logger.info("         at mz: {}".format(mz_of_resolution))
+            else:
+                self.logger.info("      mode: low-resolution")
+            self.logger.info("   natural abundance of isotopes")
+            self.logger.info("   {}".format(data_isotopes))
+            self.logger.info("   IsoCor version: {}".format(hr.__version__))
 
-        # log general information on the process
-        self.logger.info('------------------------------------------------')
-        self.logger.info("Correction process")
-        self.logger.info('------------------------------------------------')
-        self.logger.info("   data files")
-        self.logger.info("      data file: {}".format(input_file))
-        self.logger.info("      derivatives database: {}".format(derivativesfile))
-        self.logger.info("      metabolites database: {}".format(metabolitesfile))
-        self.logger.info("   correction parameters")
-        self.logger.info("      isotopic tracer: {}".format(tracer))
-        self.logger.info("      correct natural abundance of the tracer element: {}".format(correct_NA_tracer))
-        self.logger.info("      isotopic purity of the tracer: {}".format(tracer_purity))
-        if self.chVarHR.get():
-            self.logger.info("      mode: high-resolution")
-            self.logger.info("         formula code: {}".format(resolution_formula_code))
-            if useformula:
-                self.logger.info("         instrument resolution: {}".format(resolution))
-            if resolution_formula_code not in ['datafile', 'constant']:
-                self.logger.info("         at mz: {}".format(mz_of_resolution))
-        else:
-            self.logger.info("      mode: low-resolution")
-        self.logger.info("   natural abundance of isotopes")
-        self.logger.info("   {}".format(data_isotopes))
-        self.logger.info("   IsoCor version: {}".format(hr.__version__))
+            # initialize error dict
+            errors = {'labels': [], 'measurements': []}
 
-        # initialize error dict
-        errors = {'labels': [], 'measurements': []}
+            # construct correctors for all (metabolite, derivative)
+            labels = self.baseenv.getLabelsList(useformula)
+            self.logger.info('------------------------------------------------')
+            self.logger.info('Constructing correctors for all (metabolite, derivative)...')
+            self.logger.info('------------------------------------------------')
+            dictMetabolites = {}
+            for label in labels:
+                self._check_stop()
+                try:
+                    self.logger.debug("constructing {}...".format(label))
+                    if params['HR']:
+                        if not useformula:
+                            resolution = label[2]
+                            resolution_formula_code = 'constant'
+                        dictMetabolites[label] = hr.MetaboliteCorrectorFactory(
+                            formula=self.baseenv.getMetaboliteFormula(label[0]), tracer=tracer, resolution=resolution,
+                            label=label[0],
+                            data_isotopes=data_isotopes, mz_of_resolution=mz_of_resolution,
+                            derivative_formula=self.baseenv.getDerivativeFormula(label[1]), tracer_purity=tracer_purity,
+                            correct_NA_tracer=correct_NA_tracer, resolution_formula_code=resolution_formula_code,
+                            charge=self.baseenv.getMetaboliteCharge(label[0]),
+                            inchi=self.baseenv.getMetaboliteInChI(label[0]))
+                    else:
+                        dictMetabolites[label] = hr.MetaboliteCorrectorFactory(
+                            formula=self.baseenv.getMetaboliteFormula(label[0]), tracer=tracer, label=label[0],
+                            data_isotopes=data_isotopes,
+                            derivative_formula=self.baseenv.getDerivativeFormula(label[1]), tracer_purity=tracer_purity,
+                            correct_NA_tracer=correct_NA_tracer, inchi=self.baseenv.getMetaboliteInChI(label[0]))
+                    self.logger.info("{} successfully constructed.".format(label))
+                except Exception as err:
+                    dictMetabolites[label] = None
+                    errors['labels'] = errors['labels'] + [label]
+                    self.logger.error("cannot construct {}: {}".format(label, err))
 
-        # construct correctors for all (metabolite, derivative)
-        labels = self.baseenv.getLabelsList(useformula)
-        self.logger.info('------------------------------------------------')
-        self.logger.info('Constructing correctors for all (metabolite, derivative)...')
-        self.logger.info('------------------------------------------------')
-        dictMetabolites = {}
-        for label in labels:
-            try:
-                self.logger.debug("constructing {}...".format(label))
-                if self.chVarHR.get():
-                    if not useformula:
-                        resolution = label[2]
-                        resolution_formula_code = 'constant'
-                    dictMetabolites[label] = hr.MetaboliteCorrectorFactory(
-                        formula=self.baseenv.getMetaboliteFormula(label[0]), tracer=tracer, resolution=resolution,
-                        label=label[0],
-                        data_isotopes=data_isotopes, mz_of_resolution=mz_of_resolution,
-                        derivative_formula=self.baseenv.getDerivativeFormula(label[1]), tracer_purity=tracer_purity,
-                        correct_NA_tracer=correct_NA_tracer, resolution_formula_code=resolution_formula_code,
-                        charge=self.baseenv.getMetaboliteCharge(label[0]),
-                        inchi=self.baseenv.getMetaboliteInChI(label[0]))
-                else:
-                    dictMetabolites[label] = hr.MetaboliteCorrectorFactory(
-                        formula=self.baseenv.getMetaboliteFormula(label[0]), tracer=tracer, label=label[0],
-                        data_isotopes=data_isotopes,
-                        derivative_formula=self.baseenv.getDerivativeFormula(label[1]), tracer_purity=tracer_purity,
-                        correct_NA_tracer=correct_NA_tracer, inchi=self.baseenv.getMetaboliteInChI(label[0]))
-                self.logger.info("{} successfully constructed.".format(label))
-            except Exception as err:
-                dictMetabolites[label] = None
-                errors['labels'] = errors['labels'] + [label]
-                self.logger.error("cannot construct {}: {}".format(label, err))
-
-        # correct measurements for naturally occuring isotopes
-        # note: the correction matrix is constructed only once (at first correction of a (metabolite, derivative))
-        self.logger.info('------------------------------------------------')
-        self.logger.info('Correcting raw MS data...')
-        self.logger.info('------------------------------------------------')
-        df = pd.DataFrame()
-        for label in labels:
-            metabo = dictMetabolites[label]
-            series, series_err = self.baseenv.getDataSerie(label, useformula)
-            for s_err in series_err:
-                errors['measurements'] = errors['measurements'] + ["{} - {}".format(s_err, label)]
-                self.logger.error(
-                    "{} - {}: Measurement vector is incomplete, some isotopologues are not provided.".format(s_err,
-                                                                                                             label))
-            for serie in series:
-                if metabo:
-                    try:
-                        isotopic_inchi = metabo.isotopic_inchi
-                        valuesCorrected = metabo.correct(serie[1])
-                        self.logger.info("{} - {}: processed".format(serie[0], label))
-                    except Exception as err:
+            # correct measurements for naturally occuring isotopes
+            # note: the correction matrix is constructed only once (at first correction of a (metabolite, derivative))
+            self.logger.info('------------------------------------------------')
+            self.logger.info('Correcting raw MS data...')
+            self.logger.info('------------------------------------------------')
+            rows, index = [], []
+            for label in labels:
+                metabo = dictMetabolites[label]
+                series, series_err = self.baseenv.getDataSerie(label, useformula)
+                for s_err in series_err:
+                    errors['measurements'] = errors['measurements'] + ["{} - {}".format(s_err, label)]
+                    self.logger.error(
+                        "{} - {}: Measurement vector is incomplete, some isotopologues are not provided.".format(s_err,
+                                                                                                                 label))
+                for serie in series:
+                    self._check_stop()
+                    if metabo:
+                        try:
+                            isotopic_inchi = metabo.isotopic_inchi
+                            valuesCorrected = metabo.correct(serie[1])
+                            self.logger.info("{} - {}: processed".format(serie[0], label))
+                        except Exception as err:
+                            isotopic_inchi = [''] * len(serie[1])
+                            valuesCorrected = (
+                            [np.nan] * len(serie[1]), [np.nan] * len(serie[1]), [np.nan] * len(serie[1]), np.nan)
+                            self.logger.error("{} - {}: {}".format(serie[0], label, err))
+                            errors['measurements'] = errors['measurements'] + ["{} - {}".format(serie[0], label)]
+                    else:
                         isotopic_inchi = [''] * len(serie[1])
                         valuesCorrected = (
                         [np.nan] * len(serie[1]), [np.nan] * len(serie[1]), [np.nan] * len(serie[1]), np.nan)
-                        self.logger.error("{} - {}: {}".format(serie[0], label, err))
                         errors['measurements'] = errors['measurements'] + ["{} - {}".format(serie[0], label)]
-                else:
-                    isotopic_inchi = [''] * len(serie[1])
-                    valuesCorrected = (
-                    [np.nan] * len(serie[1]), [np.nan] * len(serie[1]), [np.nan] * len(serie[1]), np.nan)
-                    errors['measurements'] = errors['measurements'] + ["{} - {}".format(serie[0], label)]
-                    self.logger.error(
-                        "{} - {}: (metabolite, derivative) corrector could not be constructed.".format(serie[0], label))
+                        self.logger.error(
+                            "{} - {}: (metabolite, derivative) corrector could not be constructed.".format(serie[0], label))
 
-                for i, line in enumerate(zip(*(serie[1], valuesCorrected[0], valuesCorrected[1], valuesCorrected[2],
-                                               [valuesCorrected[3]] * len(valuesCorrected[0])))):
-                    df = pd.concat((df, pd.DataFrame([line], index=pd.MultiIndex.from_tuples(
-                        [[serie[0], label[0], label[1], i, isotopic_inchi[i]]], names=[
-                            'sample', 'metabolite', 'derivative', 'isotopologue', 'isotopic_inchi']),
-                                                     columns=['area', 'corrected_area', 'isotopologue_fraction',
-                                                              'residuum', 'mean_enrichment'])))
+                    for i, line in enumerate(zip(*(serie[1], valuesCorrected[0], valuesCorrected[1], valuesCorrected[2],
+                                                   [valuesCorrected[3]] * len(valuesCorrected[0])))):
+                        rows.append(line)
+                        index.append((serie[0], label[0], label[1], i, isotopic_inchi[i]))
 
-        # save results
-        out_file = Path(self.varOutputPath.get()).joinpath(fin_base + '_res.tsv')
-        df.to_csv(str(out_file), sep='\t')
+            # save results
+            df = results_dataframe(rows, index)
+            out_file = params['out_file']
+            df.to_csv(str(out_file), sep='\t')
 
-        # summary results for logs
-        self.logger.info('------------------------------------------------')
-        self.logger.info("Correction process summary")
-        self.logger.info('------------------------------------------------')
-        self.logger.info("   number of samples: {}".format(len(self.baseenv.getSamplesList())))
-        if useformula:
-            self.logger.info("   number of (metabolite, derivative): {}".format(len(labels)))
-        else:
-            self.logger.info("   number of (metabolite, derivative, resolution): {}".format(len(labels)))
-        nb_errors = len(errors['labels']) + len(errors['measurements'])
-        self.logger.info("   errors: {}".format(nb_errors))
-        if nb_errors:
-            self.logger.info("      {} errors during construction of (metabolite, derivative) correctors".format(
-                len(errors['labels'])))
-            self.logger.info("      {} errors during correction of measurements".format(len(errors['measurements'])))
-            self.logger.info("      detailed information on errors are provided above.")
-
-        # remove filehandler from the logger, and close the file
-        self.logger.removeHandler(file_handler)
-        file_handler.close()
-        # log levels:
-        # self.logger.debug('debug message')
-        # self.logger.info('info message')
-        # self.logger.warn('warn message')
-        # self.logger.error('error message')
-        # self.logger.critical('critical message')
-        self.stop_process()
+            # summary results for logs
+            self.logger.info('------------------------------------------------')
+            self.logger.info("Correction process summary")
+            self.logger.info('------------------------------------------------')
+            self.logger.info("   number of samples: {}".format(len(self.baseenv.getSamplesList())))
+            if useformula:
+                self.logger.info("   number of (metabolite, derivative): {}".format(len(labels)))
+            else:
+                self.logger.info("   number of (metabolite, derivative, resolution): {}".format(len(labels)))
+            nb_errors = len(errors['labels']) + len(errors['measurements'])
+            self.logger.info("   errors: {}".format(nb_errors))
+            if nb_errors:
+                self.logger.info("      {} errors during construction of (metabolite, derivative) correctors".format(
+                    len(errors['labels'])))
+                self.logger.info("      {} errors during correction of measurements".format(len(errors['measurements'])))
+                self.logger.info("      detailed information on errors are provided above.")
+            self.logger.info("   results saved in: {}".format(out_file))
+            self.logger.info("   log saved in: {}".format(log_file))
+        finally:
+            # remove filehandler from the logger, and close the file
+            self.logger.removeHandler(file_handler)
+            file_handler.close()
+        return out_file
 
     def cleanLog(self):
         self.logstream.config(state="normal")
@@ -488,9 +612,8 @@ class GUIinterface(ttk.Frame):
         self.logstream.config(state="disabled")
 
     def cleanData(self):
-        self.datatext.config(state="normal")
-        self.datatext.delete(1.0, tk.END)
-        self.datatext.config(state="disabled")
+        self.datatable.delete(*self.datatable.get_children())
+        self.datatable.configure(columns=())
 
     def cleanListTracer(self):
         self.cleanDfIsotopes = self.baseenv.dfIsotopes[(self.baseenv.dfIsotopes.abundance > 0) & (
@@ -502,24 +625,42 @@ class GUIinterface(ttk.Frame):
 
     def loadData(self):
         "load data Callback"
-        # Using try in case user types in unknown file or closes without choosing a file.
+        current = self.varInputPath.get()
+        name = filedialog.askopenfilename(initialdir=str(Path(current).parent) if current else str(self.baseenv.home),
+                                          filetypes=(
+                                              ("Data File", "*.tsv"), ("All Files", "*.*")),
+                                          title="Choose a file."
+                                          )
+        if name:
+            self.openDataFile(name)
+
+    def openDataFile(self, name):
+        """Select the measurements file and show its content."""
         try:
-            name = filedialog.askopenfilename(initialdir="C:/Users/Batman/Documents/Programming/tkinter/",
-                                              filetypes=(
-                                                  ("Data File", "*.tsv"), ("All Files", "*.*")),
-                                              title="Choose a file."
-                                              )
-            if name:
-                self.cleanLog()
-                self.cleanData()
-                self.varInputPath.set(name)
-                self.varOutputPath.set(Path(name).parent)
-                with open(name, 'r', encoding='utf-8') as UseFile:
-                    self.datatext.configure(state='normal')
-                    self.datatext.insert(tk.INSERT, UseFile.read())
-                    self.datatext.configure(state='disable')
-        except:
-            pass
+            with open(name, 'r', encoding='utf-8') as fp:
+                data = pd.read_csv(fp, delimiter='\t', dtype=str, keep_default_na=False)
+        except Exception as err:
+            messagebox.showerror("Error", "Cannot read the measurements file:\n'{}'.\n\n{}".format(name, err))
+            return
+        self.cleanLog()
+        self.cleanData()
+        self.varInputPath.set(name)
+        self.varOutputPath.set(Path(name).parent)
+        self.showData(data)
+
+    def showData(self, data):
+        """Show a table of measurements in the data preview."""
+        columns = [str(c) for c in data.columns]
+        self.datatable.configure(columns=columns)
+        text_font = tkfont.nametofont('TkDefaultFont')
+        heading_font = tkfont.nametofont('TkHeadingFont')
+        for i, col in enumerate(columns):
+            # column width fitted to the heading and to the first values
+            width = max([heading_font.measure(col)] + [text_font.measure(v) for v in data.iloc[:, i].head(200)])
+            self.datatable.heading(col, text=col, anchor='w')
+            self.datatable.column(col, width=min(width + 16, 300), stretch=False, anchor='w')
+        for values in data.itertuples(index=False):
+            self.datatable.insert('', tk.END, values=list(values))
 
     def outputDir(self):
         "gui output path"
@@ -537,41 +678,41 @@ class GUIinterface(ttk.Frame):
     def enableHR(self):
         if self.chVarHR.get():
             for child in self.highResFrame.winfo_children():
-                child.configure(state='enable')
+                child.configure(state='normal')
             self.formulaEntered.configure(state='readonly')
         else:
             for child in self.highResFrame.winfo_children():
-                child.configure(state='disable')
+                child.configure(state='disabled')
         self.enableAtmz(None)
 
     def enableAtmz(self, event):
         if not self.chVarHR.get():
-            self.mzEntry.configure(state='disable')
-            self.mzlbl.configure(state='disable')
-            self.masslbl.configure(state='disable')
-            self.massEntry.configure(state='disable')
-            self.formulalbl.configure(state='disable')
+            self.mzEntry.configure(state='disabled')
+            self.mzlbl.configure(state='disabled')
+            self.masslbl.configure(state='disabled')
+            self.massEntry.configure(state='disabled')
+            self.formulalbl.configure(state='disabled')
             self.formulaEntered.configure(state="disabled")
         elif self.formulaEntered.get() == 'constant':
-            self.mzEntry.configure(state='disable')
-            self.mzlbl.configure(state='disable')
-            self.masslbl.configure(state='enable')
-            self.massEntry.configure(state='enable')
-            self.formulalbl.configure(state='enable')
+            self.mzEntry.configure(state='disabled')
+            self.mzlbl.configure(state='disabled')
+            self.masslbl.configure(state='normal')
+            self.massEntry.configure(state='normal')
+            self.formulalbl.configure(state='normal')
             self.formulaEntered.configure(state="readonly")
         elif self.formulaEntered.get() == 'datafile':
-            self.mzEntry.configure(state='disable')
-            self.mzlbl.configure(state='disable')
-            self.masslbl.configure(state='disable')
-            self.massEntry.configure(state='disable')
-            self.formulalbl.configure(state='enable')
+            self.mzEntry.configure(state='disabled')
+            self.mzlbl.configure(state='disabled')
+            self.masslbl.configure(state='disabled')
+            self.massEntry.configure(state='disabled')
+            self.formulalbl.configure(state='normal')
             self.formulaEntered.configure(state="readonly")
         else:
-            self.mzEntry.configure(state='enable')
-            self.mzlbl.configure(state='enable')
-            self.masslbl.configure(state='enable')
-            self.massEntry.configure(state='enable')
-            self.formulalbl.configure(state='enable')
+            self.mzEntry.configure(state='normal')
+            self.mzlbl.configure(state='normal')
+            self.masslbl.configure(state='normal')
+            self.massEntry.configure(state='normal')
+            self.formulalbl.configure(state='normal')
             self.formulaEntered.configure(state="readonly")
 
     def updatePurity(self, event):
@@ -588,11 +729,14 @@ class GUIinterface(ttk.Frame):
             self.log_level = "INFO"
         self.logger.setLevel(self.log_level)
 
-    def enablePurity(self):
-        pass
-
     def update_DBpath(self):
         self.baseenv.db_path = Path(self.varDatabasePath.get())
+
+    @staticmethod
+    def _show_end_of_path(var, entry):
+        """Keep the end of the path (i.e. the file name) visible in the entry."""
+        var.trace_add('write', lambda *args: entry.after_idle(entry.xview_moveto, 1.0))
+        entry.bind('<Configure>', lambda event: entry.xview_moveto(1.0))
 
     def createWidgets(self):
         content = ttk.Frame(self, padding=(3, 3, 12, 12))
@@ -602,15 +746,13 @@ class GUIinterface(ttk.Frame):
         self.TracerOptFrame = ttk.LabelFrame(
             optionFrame, text='Tracer correction options')
 
-        tr_lab = ttk.Label(text="Isotopic purity of the tracer (*)")
+        tr_lab = ttk.Label(text="Isotopic purity of the tracer (?)")
         purityLblFrame = ttk.LabelFrame(
             self.TracerOptFrame, labelwidget=tr_lab)
         self.scrollPurity = ttk.Scrollbar(purityLblFrame, orient='vertical')
         self.purityManager = PurityTracerManager(
             purityLblFrame, width=200, height=90, highlightthickness=0, yscrollcommand=self.scrollPurity.set)
         self.scrollPurity.config(command=self.purityManager.yview)
-        purityLblFrame.update_idletasks()
-        self.purityManager.config(scrollregion=self.purityManager.bbox("all"))
 
         tracer_list = list(self.cleanDfIsotopes['subscriptName'])
         self.isotopictracerEntered = tk.StringVar()
@@ -622,16 +764,16 @@ class GUIinterface(ttk.Frame):
         # default value: 13C
         try:
             default_tracer = tracer_list.index(u"\u00B9\u00B3\u0043")
-        except:
+        except ValueError:
             default_tracer = 0
         self.isotopictracerCBB.current(default_tracer)
         self.updatePurity(None)
 
-        self.chVarHR = tk.IntVar()
-        self.R1 = tk.Radiobutton(optionFrame, text="Low resolution (*)", variable=self.chVarHR, value=False,
-                                 command=self.enableHR)
-        self.R2 = tk.Radiobutton(optionFrame, text="High resolution (*)", variable=self.chVarHR, value=True,
-                                 command=self.enableHR)
+        self.chVarHR = tk.IntVar(value=0)
+        self.R1 = ttk.Radiobutton(optionFrame, text="Low resolution (?)", variable=self.chVarHR, value=0,
+                                  command=self.enableHR)
+        self.R2 = ttk.Radiobutton(optionFrame, text="High resolution (?)", variable=self.chVarHR, value=1,
+                                  command=self.enableHR)
 
         self.highResFrame = ttk.LabelFrame(
             optionFrame, text='High resolution parameters')
@@ -652,19 +794,16 @@ class GUIinterface(ttk.Frame):
 
         self.chVarVerboseLog = tk.IntVar()
         self.chVarNatAbTracer = tk.IntVar()
-        self.chVarPurityTracer = tk.IntVar()
         self.chVerboseLog = ttk.Checkbutton(
-            content, text="Verbose logs (*)", variable=self.chVarVerboseLog, command=self.updateLogLevel)
+            content, text="Verbose logs (?)", variable=self.chVarVerboseLog, command=self.updateLogLevel)
         self.processButon = ttk.Button(
             content, text=" Process ", command=self.start_process)
         self.chNatAbTracer = ttk.Checkbutton(
-            self.TracerOptFrame, text="Correct natural abondance of the tracer element (*)",
+            self.TracerOptFrame, text="Correct natural abundance of the tracer element (?)",
             variable=self.chVarNatAbTracer)
         self.varInputPath = tk.StringVar()
         self.varOutputPath = tk.StringVar()
-        self.varOutputPath.set(self.baseenv.home)
         self.varDatabasePath = tk.StringVar()
-        self.varDatabasePath.set(self.baseenv.default_db)
         self.inputDataEntry = ttk.Entry(
             dataFrame, textvariable=self.varInputPath, state='readonly')
         self.loadbutton = ttk.Button(
@@ -676,17 +815,37 @@ class GUIinterface(ttk.Frame):
         self.databaseEntry = ttk.Entry(
             dataFrame, textvariable=self.varDatabasePath, state='readonly')
         self.databasePathSubmit = ttk.Button(
-            dataFrame, text=" Databases Path (*)", command=self.databaseDir)
+            dataFrame, text=" Databases Path (?)", command=self.databaseDir)
+        for var, entry in ((self.varInputPath, self.inputDataEntry), (self.varOutputPath, self.outputDataEntry),
+                           (self.varDatabasePath, self.databaseEntry)):
+            self._show_end_of_path(var, entry)
+        self.varOutputPath.set(self.baseenv.home)
+        self.varDatabasePath.set(self.baseenv.default_db)
         scrolH = 10
-        self.datatext = scrolledtext.ScrolledText(
-            dataFrame, width=40, height=scrolH, wrap=tk.WORD)
-        self.datatext.configure(state='disable')
+        # preview of the measurements file, as a table
+        # fixed requested size: the window must not grow with the number of columns of the table
+        previewFrame = ttk.Frame(dataFrame, width=330, height=190)
+        previewFrame.grid_propagate(False)
+        self.datatable = ttk.Treeview(previewFrame, show='headings', height=8, selectmode='none')
+        dataYScroll = ttk.Scrollbar(previewFrame, orient='vertical', command=self.datatable.yview)
+        dataXScroll = ttk.Scrollbar(previewFrame, orient='horizontal', command=self.datatable.xview)
+        self.datatable.configure(yscrollcommand=dataYScroll.set, xscrollcommand=dataXScroll.set)
         self.logstream = scrolledtext.ScrolledText(
             content, height=scrolH, wrap=tk.WORD, state="disabled")
 
         for child in self.highResFrame.winfo_children():
-            child.configure(state='disable')
+            child.configure(state='disabled')
 
+        # layout: the data preview and the logs grow with the window
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(0, weight=1)
+        content.rowconfigure(2, weight=1)
+        dataFrame.columnconfigure(0, weight=1)
+        dataFrame.rowconfigure(2, weight=1)
+        previewFrame.columnconfigure(0, weight=1)
+        previewFrame.rowconfigure(0, weight=1)
         content.grid(column=0, row=0, sticky='NSWE')
         dataFrame.grid(column=0, row=0, sticky='NSWE')
         optionFrame.grid(column=1, row=0, sticky='NSW')
@@ -712,11 +871,14 @@ class GUIinterface(ttk.Frame):
         self.outputPathSubmit.grid(column=0, row=4, sticky='NWE')
         self.databaseEntry.grid(column=0, row=5, sticky='NWE')
         self.databasePathSubmit.grid(column=0, row=6, sticky='NWE')
-        self.datatext.grid(column=0, row=2, sticky='NSWE')
+        previewFrame.grid(column=0, row=2, sticky='NSWE')
+        self.datatable.grid(column=0, row=0, sticky='NSWE')
+        dataYScroll.grid(column=1, row=0, sticky='NS')
+        dataXScroll.grid(column=0, row=1, sticky='WE')
         self.processButon.grid(column=0, row=1, columnspan=2, sticky='NWE')
-        self.logstream.grid(column=0, row=2, columnspan=2, sticky='NWE')
+        self.logstream.grid(column=0, row=2, columnspan=2, sticky='NSWE')
         self.chVerboseLog.grid(column=0, row=3, sticky='NW')
-        tk.Label(content, text="Note: infotip available over items with '(*)'").grid(column=1, row=3, sticky='NE')
+        ttk.Label(content, text="Hover over items marked (?) for help.").grid(column=1, row=3, sticky='NE')
 
         # create tooltip helpers
         Tooltip(self.chNatAbTracer,
@@ -725,8 +887,8 @@ class GUIinterface(ttk.Frame):
         Tooltip(self.R2,
                 text="For measurements collected at high or ultrahigh resolution (e.g. on Orbitrap or FT-ICR instruments).")
         Tooltip(tr_lab,
-                text="Correct for the contribution of isotopic impurities of the tracer at labeled positions. The isotopic purity is typically obtained from the manufacturer.\ne.g. for \u00B9\u00B3C-substates with purity of 99%, use 0.01 for \u00B9\u00B2C and 0.99 for \u00B9\u00B3C.")
-        Tooltip(self.chVerboseLog, text="Useful in case of trouble. Join it to the issue on github.")
+                text="Correct for the contribution of isotopic impurities of the tracer at labeled positions. The isotopic purity is typically obtained from the manufacturer.\ne.g. for \u00B9\u00B3C-substrates with purity of 99%, use 0.01 for \u00B9\u00B2C and 0.99 for \u00B9\u00B3C.")
+        Tooltip(self.chVerboseLog, text="Log more details. Useful in case of trouble: attach the log file when reporting an issue on GitHub.")
         Tooltip(self.databasePathSubmit, text="Folder containing all database files.")
 
         # create texthandler and formatter to display logs
@@ -752,23 +914,20 @@ def openGit():
 
 
 def checkupdateto():
-    """Compare local and distant IsoCor version."""
+    """Return the latest IsoCor version available online, or None if it cannot be retrieved."""
     try:
         # Get the distant __init__.py and read its version as it done in setup.py
-        response = urllib.request.urlopen("https://github.com/MetaSys-LISBP/IsoCor/raw/master/isocor/__init__.py")
+        response = urllib.request.urlopen("https://github.com/MetaSys-LISBP/IsoCor/raw/master/isocor/__init__.py",
+                                          timeout=10)
         data = response.read()
         txt = data.decode('utf-8').rstrip()
-        lastversion = re.findall(r"^__version__ = ['\"]([^'\"]*)['\"]", txt, re.M)[0]
-        if lastversion != hr.__version__:
-            messagebox.showwarning('Version {} available'.format(lastversion),
-                                   'You can update IsoCor with:\n"pip install --upgrade isocor"\nCheck the documentation for more information.')
-    except:
-        pass  # silently ignore everything that just happened
+        return re.findall(r"^__version__ = ['\"]([^'\"]*)['\"]", txt, re.M)[0]
+    except Exception:
+        return None  # silently ignore everything that just happened
 
 
 def start_gui():
     root = tk.Tk()
-    root.resizable(width=False, height=False)
     # create menu
     menubar = tk.Menu(root)
     root.config(menu=menubar)
@@ -782,7 +941,18 @@ def start_gui():
     # start GUI
     app = GUIinterface(master=root)
     app.master.title("IsoCor {}".format(hr.__version__))
-    # check version in a specific thread
-    threadUpd = threading.Thread(target=checkupdateto)
-    threadUpd.start()
+    # the window can be enlarged, but not made smaller than its content
+    root.update_idletasks()
+    root.minsize(root.winfo_reqwidth(), root.winfo_reqheight())
+    # check version in a specific thread, and show the result from the main thread
+    lastversion = []
+    threading.Thread(target=lambda: lastversion.append(checkupdateto()), daemon=True).start()
+
+    def showUpdate():
+        if not lastversion:
+            root.after(500, showUpdate)
+        elif lastversion[0] is not None and lastversion[0] != hr.__version__:
+            messagebox.showwarning('Version {} available'.format(lastversion[0]),
+                                   'You can update IsoCor with:\n"pip install --upgrade isocor"\nCheck the documentation for more information.')
+    root.after(500, showUpdate)
     app.mainloop()
