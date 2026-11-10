@@ -51,7 +51,7 @@ class EnvComputing(object):
         return d
 
     def _stripColNames(self, df):
-        df.rename(columns=lambda x: x.strip(), inplace=True)
+        df.columns = [str(x).strip() for x in df.columns]
 
     def _stripCol(self, df, listcolumns):
         for col in listcolumns:
@@ -261,10 +261,82 @@ class EnvComputing(object):
         return l, l_err
 
 
-def results_dataframe(rows, index):
+def results_dataframe(rows, index, extra_columns=()):
     """Return the table of results from its rows and index tuples."""
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows, index=pd.MultiIndex.from_tuples(index, names=[
         'sample', 'metabolite', 'derivative', 'isotopologue', 'isotopic_inchi']),
-                        columns=['area', 'corrected_area', 'isotopologue_fraction', 'residuum', 'mean_enrichment'])
+                        columns=['area', 'corrected_area', 'isotopologue_fraction', 'residuum',
+                                 'mean_enrichment'] + list(extra_columns))
+
+
+# Default tolerance on the difference between the measured and the theoretical fractions
+# of the peaks of unlabeled samples
+UNLABELED_TOLERANCE = 0.02
+
+
+def parse_samples(text):
+    """Return the list of sample names from a comma-separated string."""
+    return [name.strip() for name in text.split(',') if name.strip()]
+
+
+def extra_columns(relative_sd=None, absolute_sd=None, unconstrained=False):
+    """Return the names of the optional columns of the results."""
+    columns = []
+    if relative_sd or absolute_sd:
+        columns += ['isotopologue_fraction_sd', 'mean_enrichment_sd']
+    if unconstrained:
+        columns += ['isotopologue_fraction_unconstrained', 'mean_enrichment_unconstrained']
+    return columns
+
+
+def extra_values(metabo, measurement, relative_sd=None, absolute_sd=None, unconstrained=False):
+    """Return the values of the optional columns of the results (see :py:func:`~extra_columns`).
+
+    Args:
+        metabo: corrector, or None if it could not be constructed
+        measurement (list): measured areas
+
+    Returns:
+        list: for each optional column, the list of its values for each peak
+    """
+    n_peaks = len(measurement)
+    missing = [np.nan] * n_peaks
+    values = []
+    if relative_sd or absolute_sd:
+        try:
+            fraction_sd, enrichment_sd = metabo.get_uncertainty(
+                measurement, relative_sd=relative_sd or 0., absolute_sd=absolute_sd or 0.)
+            values += [list(fraction_sd), [enrichment_sd] * n_peaks]
+        except Exception:
+            values += [missing, missing]
+    if unconstrained:
+        try:
+            _, fraction, enrichment = metabo.correct_unconstrained(measurement)
+            values += [list(fraction), [enrichment] * n_peaks]
+        except Exception:
+            values += [missing, missing]
+    return values
+
+
+def check_unlabeled(logger, metabo, sample, label, measurement, tolerance=UNLABELED_TOLERANCE):
+    """Compare an unlabeled sample to the theoretical isotopic pattern, and log the result.
+
+    Returns:
+        bool: True if the measurement differs from the theoretical pattern by more than the tolerance
+    """
+    try:
+        deviation = metabo.compare_to_unlabeled(measurement)
+        worst = int(np.nanargmax(np.abs(deviation)))
+    except Exception:
+        return False  # nothing to compare (the error is reported by the correction)
+    message = "{} - {}: unlabeled control, largest difference with the theoretical pattern is" \
+              " {:+.4f} (isotopologue {})".format(sample, label, deviation[worst], worst)
+    if abs(deviation[worst]) > tolerance:
+        logger.warning(message + ", above the tolerance ({:g}). Check the formulas of the metabolite"
+                                 " and of the derivative, the resolution, and the integration of"
+                                 " the peaks (interferences, saturation).".format(tolerance))
+        return True
+    logger.info(message + ".")
+    return False

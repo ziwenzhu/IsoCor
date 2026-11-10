@@ -153,6 +153,7 @@ class LowResMetaboliteCorrector(LabelledChemical, InterfaceMSCorrector):
     def __init__(self, formula, tracer, **kwargs):
         LabelledChemical.__init__(self, formula, tracer, **kwargs)
         InterfaceMSCorrector.__init__(self)
+        self._unlabeled_pattern = None
         # Log if direct instanciation
         if self.__class__.__name__ == LowResMetaboliteCorrector.__name__:
             self._log_on_init()
@@ -187,7 +188,16 @@ class LowResMetaboliteCorrector(LabelledChemical, InterfaceMSCorrector):
         """
         logger.debug("New correction for %s with: measurement=%s.",
                      self.label, measurement)
-        # Check length
+        self._check_measurement(measurement)
+        # Perform the actual correction
+        corrected_area, iso_fraction, residuum, enrichment = self._correct_with_bfgs(
+            measurement)
+        logger.debug(
+            "Finished correction. Residuum (normalized to 1): %s", residuum)
+        return corrected_area, iso_fraction, residuum, enrichment
+
+    def _check_measurement(self, measurement):
+        """Check the length and the values of a measurement vector."""
         if len(measurement) != self.formula[self._tracer_el] + 1:
             raise ValueError("The length of the measured isotopic cluster ({}) is different"
                              " than the required number of measurements: {}"
@@ -197,12 +207,115 @@ class LowResMetaboliteCorrector(LabelledChemical, InterfaceMSCorrector):
         if not np.all(np.isfinite(np.asarray(measurement, dtype=float))):
             raise ValueError("The measured isotopic cluster contains missing or non-finite"
                              " values: {}".format(measurement))
-        # Perform the actual correction
-        corrected_area, iso_fraction, residuum, enrichment = self._correct_with_bfgs(
-            measurement)
-        logger.debug(
-            "Finished correction. Residuum (normalized to 1): %s", residuum)
-        return corrected_area, iso_fraction, residuum, enrichment
+
+    def correct_unconstrained(self, measurement):
+        """Return the corrected measurement vector without the non-negativity constraint.
+
+        :py:meth:`~correct` constrains the corrected areas to be positive, hence noise on
+        isotopologues that are absent can only increase their estimated abundance, which
+        biases isotopologue fractions and mean enrichment upward. The unconstrained
+        solution may contain (slightly) negative values, but is unbiased.
+
+        Args:
+            measurement (list): measured areas
+
+        Returns:
+            tuple:
+                - corrected_area (array): Corrected area for each peak.
+                - isotopologue_fraction (list): corrected area normalized to 1.
+                - mean enrichment
+        """
+        self._check_measurement(measurement)
+        v_mes = np.asarray(measurement, dtype=float)
+        corrected_area = np.linalg.lstsq(self.correction_matrix, v_mes, rcond=None)[0]
+        sum_p = math.fsum(corrected_area)
+        if sum_p != 0:
+            isotopologue_fraction = [p/sum_p for p in corrected_area]
+            enrichment = math.fsum(
+                p*i for i, p in enumerate(isotopologue_fraction))/self.formula[self._tracer_el]
+        else:
+            isotopologue_fraction = [np.nan for p in corrected_area]
+            enrichment = np.nan
+        return corrected_area, isotopologue_fraction, enrichment
+
+    def get_uncertainty(self, measurement, relative_sd=0., absolute_sd=0.):
+        """Return the standard deviations of the corrected values, given the measurement errors.
+
+        Measurement errors are assumed to be independent, with standard deviation
+        sqrt(absolute_sd**2 + (relative_sd * area)**2) for each peak. They are propagated
+        linearly through the (unconstrained) correction and the normalization.
+
+        Args:
+            measurement (list): measured areas
+            relative_sd (float): relative standard deviation of the areas (e.g. 0.02 for 2 %)
+            absolute_sd (float): absolute standard deviation of the areas (same unit as areas)
+
+        Returns:
+            tuple:
+                - isotopologue_fraction_sd (array): standard deviation of each isotopologue fraction
+                - mean_enrichment_sd (float): standard deviation of the mean enrichment
+        """
+        self._check_measurement(measurement)
+        relative_sd, absolute_sd = float(relative_sd), float(absolute_sd)
+        if not (relative_sd >= 0. and absolute_sd >= 0.):
+            raise ValueError("Standard deviations of measurements should be positive numbers"
+                             " (relative_sd={}, absolute_sd={}).".format(relative_sd, absolute_sd))
+        v_mes = np.asarray(measurement, dtype=float)
+        n_isotopologues = len(v_mes)
+        variance = absolute_sd**2 + (relative_sd * v_mes)**2
+        inverse = np.linalg.pinv(self.correction_matrix)
+        corrected_area = np.dot(inverse, v_mes)
+        sum_p = corrected_area.sum()
+        if sum_p == 0:
+            return np.full(n_isotopologues, np.nan), np.nan
+        cov_area = np.dot(inverse * variance, inverse.T)
+        # jacobian of the normalization: fraction_i = area_i / sum(area)
+        fraction = corrected_area / sum_p
+        jacobian = (np.eye(n_isotopologues) - np.outer(fraction, np.ones(n_isotopologues))) / sum_p
+        cov_fraction = np.dot(np.dot(jacobian, cov_area), jacobian.T)
+        weights = np.arange(n_isotopologues) / self.formula[self._tracer_el]
+        enrichment_variance = np.dot(weights, np.dot(cov_fraction, weights))
+        return np.sqrt(np.clip(np.diag(cov_fraction), 0., None)), math.sqrt(max(enrichment_variance, 0.))
+
+    def get_unlabeled_pattern(self):
+        """Return the theoretical measurement vector of the unlabeled chemical.
+
+        This is the isotopic pattern expected for a sample without tracer, i.e. with all
+        elements (including the tracer element) at natural abundance, at the measured
+        peaks and normalized to 1. Whatever the correction options, this is what should be
+        measured in an unlabeled sample if the formulas, the resolution and the isotopic
+        data are correct.
+
+        Returns:
+            array: theoretical fractions of the measured peaks
+        """
+        if self._unlabeled_pattern is None:
+            column = np.array(self._compute_unlabeled_column(), dtype=float)
+            self._unlabeled_pattern = column / column.sum()
+        return self._unlabeled_pattern
+
+    def _compute_unlabeled_column(self):
+        return self._column_convolution(self.get_mass_distribution_vector(), 0, True)
+
+    def compare_to_unlabeled(self, measurement):
+        """Compare the measurement of an unlabeled sample to its theoretical isotopic pattern.
+
+        A large difference reveals an error that the correction itself cannot detect:
+        wrong formula of the metabolite or of the derivative, wrong resolution, interference
+        with another compound, or biased measurement (e.g. saturation).
+
+        Args:
+            measurement (list): measured areas of an unlabeled sample
+
+        Returns:
+            array: measured fractions minus theoretical fractions, for each peak
+        """
+        self._check_measurement(measurement)
+        v_mes = np.asarray(measurement, dtype=float)
+        sum_m = v_mes.sum()
+        if sum_m == 0:
+            return np.full(len(v_mes), np.nan)
+        return v_mes / sum_m - self.get_unlabeled_pattern()
 
     @staticmethod
     def _get_cost_function(mid, v_mes, mat_cor):
@@ -279,6 +392,24 @@ class LowResMetaboliteCorrector(LabelledChemical, InterfaceMSCorrector):
                      "elements of %s (convolution method): %s", self.label, result)
         return list(result)
 
+    def _column_convolution(self, correction_vector, n_traced_atoms, correct_NA_tracer):
+        """Return the measurement vector of the isotopologue with n_traced_atoms (convolution algorithm)."""
+        n_isotopologues = self.formula[self._tracer_el] + 1
+        # Peaks to keep after convolution
+        mask = [n * self._idx_tracer for n in range(n_isotopologues)]
+        column = correction_vector
+        # Correction of tracer purity
+        for _ in range(n_traced_atoms):
+            column = np.convolve(column, self.tracer_purity)
+        # Correct natural abundance of tracer element (if relevant)
+        if correct_NA_tracer:
+            for _ in range(n_isotopologues-n_traced_atoms-1):
+                column = np.convolve(
+                    column, self.data_isotopes[self._tracer_el]["abundance"])
+        # Pad with zeros (without modifying correction_vector in place)
+        column = list(column) + [0.]*max(0, max(mask)+1-len(column))
+        return [column[j] for j in mask]
+
     def _correctionmatrix_convolution(self):
         """Return the correction matrix build with the convolution algorithm.
 
@@ -291,23 +422,10 @@ class LowResMetaboliteCorrector(LabelledChemical, InterfaceMSCorrector):
         n_isotopologues = self.formula[self._tracer_el] + 1
         # create correction matrix
         correction_matrix = np.zeros((n_isotopologues, n_isotopologues))
-        # Peaks to keep after convolution
-        mask = [n * self._idx_tracer for n in range(n_isotopologues)]
         # For each atom with the same element as the tracer
         for i in range(n_isotopologues):
-            column = correction_vector
-            # Correction of tracer purity
-            for _ in range(i):
-                column = np.convolve(column, self.tracer_purity)
-            # Correct natural abundance of tracer element (if relevant)
-            if self.correct_NA_tracer:
-                for _ in range(n_isotopologues-i-1):
-                    column = np.convolve(
-                        column, self.data_isotopes[self._tracer_el]["abundance"])
-            # Pad with zeros (without modifying correction_vector in place)
-            column = list(column) + [0.]*max(0, max(mask)+1-len(column))
-            column = [column[j] for j in mask]
-            correction_matrix[:, i] = column
+            correction_matrix[:, i] = self._column_convolution(
+                correction_vector, i, self.correct_NA_tracer)
         logger.debug("Done computing correction matrix (convolution) for %s: %s",
                      self.label, correction_matrix.tolist())
         return correction_matrix
@@ -606,6 +724,53 @@ class HighResMetaboliteCorrector(LowResMetaboliteCorrector):
                      "elements of %s (high-resolution method): %s", self.label, mid)
         return [float(x) for x in mid]
 
+    def _combination_inputs(self):
+        """Return the isotopic cluster without tracer (None if empty) and the measured peaks."""
+        n_tracers = self.formula[self._tracer_el]
+        # Mass distribution vector without tracer
+        isoclust_notracer = self.get_isotopic_cluster()
+        correction_vector = None
+        if isoclust_notracer is not None:
+            correction_vector = np.array(
+                [(i, j) for i, j in isoclust_notracer.items()])
+        main_peaks = self.get_tracershifted_peaks_between(self.molecular_weight,
+                                                          self.molecular_weight + self.mzshift_tracer * n_tracers + D(0.5))
+        return correction_vector, main_peaks
+
+    def _column_combination(self, correction_vector, main_peaks, n_traced_atoms, correct_NA_tracer):
+        """Return the measurement vector of the isotopologue with n_traced_atoms (isotopic-cluster method)."""
+        n_tracers = self.formula[self._tracer_el]
+        data_tracer = self.data_isotopes[self._tracer_el]
+        n_tracer_isotopes = len(data_tracer["mass"])
+        data = {}
+        if correction_vector is not None:
+            data["cluster_notracer"] = correction_vector
+        # Correct the tracer purity and natural abundance
+        if n_traced_atoms:
+            data["purity_tracer"] = self._get_block_n(data_tracer["mass"],
+                                                      self.tracer_purity,
+                                                      n_atoms=n_traced_atoms,
+                                                      n_isotopes=n_tracer_isotopes)
+        if n_tracers-n_traced_atoms:
+            if correct_NA_tracer:
+                data["NA_tracer"] = self._get_block_n(data_tracer["mass"],
+                                                      data_tracer["abundance"],
+                                                      n_atoms=n_tracers-n_traced_atoms,
+                                                      n_isotopes=n_tracer_isotopes)
+            else:
+                data["NA_tracer"] = self._get_block_1(data_tracer["mass"][0],
+                                                      n_tracers-n_traced_atoms)
+        # Isotopic cluster with this combination of tracers
+        iso_clust = self._combine_blocks(data)
+        # Pool together unresolved peaks
+        return self.get_peaks_around(iso_clust, main_peaks)
+
+    def _compute_unlabeled_column(self):
+        if len(self.data_isotopes[self._tracer_el]["abundance"]) == 2:
+            return LowResMetaboliteCorrector._compute_unlabeled_column(self)
+        correction_vector, main_peaks = self._combination_inputs()
+        return self._column_combination(correction_vector, main_peaks, 0, True)
+
     def _correctionmatrix_combination(self):
         """Return the correction matrix constructed from the high-resolution correction vector (isotopic cluster).
 
@@ -618,44 +783,15 @@ class HighResMetaboliteCorrector(LowResMetaboliteCorrector):
             array: correction_matrix
         """
         n_tracers = self.formula[self._tracer_el]
-        data_tracer = self.data_isotopes[self._tracer_el]
-        n_tracer_isotopes = len(data_tracer["mass"])
-        # Mass distribution vector without tracer
-        isoclust_notracer = self.get_isotopic_cluster()
-        if isoclust_notracer is not None:
-            correction_vector = np.array(
-                [(i, j) for i, j in isoclust_notracer.items()])
-        main_peaks = self.get_tracershifted_peaks_between(self.molecular_weight,
-                                                          self.molecular_weight + self.mzshift_tracer * n_tracers + D(0.5))
+        correction_vector, main_peaks = self._combination_inputs()
         # Prepare the Correction matrix
         n_isotopologues = n_tracers + 1
         correction_matrix = np.zeros((n_isotopologues, n_isotopologues))
         # For each measured peak, we compute the corresponding isotopic_cluster
         for n_traced_atoms in range(n_isotopologues):
-            data = {}
-            if isoclust_notracer is not None:
-                data["cluster_notracer"] = correction_vector
-            # Correct the tracer purity and natural abundance
-            if n_traced_atoms:
-                data["purity_tracer"] = self._get_block_n(data_tracer["mass"],
-                                                          self.tracer_purity,
-                                                          n_atoms=n_traced_atoms,
-                                                          n_isotopes=n_tracer_isotopes)
-            if n_tracers-n_traced_atoms:
-                if self.correct_NA_tracer:
-                    data["NA_tracer"] = self._get_block_n(data_tracer["mass"],
-                                                          data_tracer["abundance"],
-                                                          n_atoms=n_tracers-n_traced_atoms,
-                                                          n_isotopes=n_tracer_isotopes)
-                else:
-                    data["NA_tracer"] = self._get_block_1(data_tracer["mass"][0],
-                                                          n_tracers-n_traced_atoms)
-            # Isotopic cluster with this combination of tracers
-            iso_clust = self._combine_blocks(data)
-            # Pool together unresolved peaks
-            column = self.get_peaks_around(iso_clust, main_peaks)
             # Fill the corresponding column of the correction matrix
-            correction_matrix[:, n_traced_atoms] = column
+            correction_matrix[:, n_traced_atoms] = self._column_combination(
+                correction_vector, main_peaks, n_traced_atoms, self.correct_NA_tracer)
         logger.debug("Done computing correction matrix (isotopic-cluster method)"
                      " for %s: %s", self.label, correction_matrix.tolist())
         return correction_matrix

@@ -210,6 +210,24 @@ The result file is a TSV file with the following columns:
 :residuum: Residuum of the fit (difference between experimental and optimal isotopologue distribution, normalized to 1).
 :mean_enrichment: Mean molecular content in isotopic tracer in the metabolite.
 
+The following columns are added if the corresponding quality control options are used:
+
+:isotopologue_fraction_sd: Standard deviation of each isotopologue fraction, propagated from the measurement error provided by the user ('Measurement error' in the graphical interface, :samp:`--relative_sd` and :samp:`--absolute_sd` in the command line interface).
+:mean_enrichment_sd: Standard deviation of the mean enrichment.
+:isotopologue_fraction_unconstrained: Isotopologue fractions obtained without constraining corrected areas to be positive. Noise on isotopologues that are absent can only increase their constrained estimate, which slightly biases isotopologue fractions and mean enrichment upward; the unconstrained values may be negative, but are unbiased.
+:mean_enrichment_unconstrained: Mean enrichment calculated from the unconstrained isotopologue fractions.
+
+
+Unlabeled control samples
+--------------------------------------------------------------------------------
+
+The correction fits as many isotopologues as there are measured peaks, hence the residuum is null even if
+the formula of the metabolite or of the derivative is wrong. Such errors can be detected with samples that do not
+contain the tracer: provide their names ('Unlabeled samples' in the graphical interface, :samp:`--unlabeled`
+in the command line interface), and IsoCor compares their measurements to the isotopic pattern expected at natural abundance.
+The largest difference is reported in the logs for each metabolite, with a warning if it is above the tolerance (0.02 by default).
+A warning reveals a wrong formula, a wrong resolution, an interference with another compound or a biased measurement.
+
 
 Log file
 --------------------------------------------------------------------------------

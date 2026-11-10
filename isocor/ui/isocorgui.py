@@ -4,6 +4,7 @@ from tkinter import font as tkfont
 from tkinter import scrolledtext
 from tkinter import filedialog
 from tkinter import messagebox
+from isocor.ui import isocordb
 from isocor.ui.isocordb import EnvComputing, results_dataframe
 import logging
 import pandas as pd
@@ -443,6 +444,21 @@ class GUIinterface(ttk.Frame):
             if not overwrite:
                 return None
         params['log_level'] = self.log_level
+
+        # optional quality controls
+        params['unlabeled'] = isocordb.parse_samples(self.varUnlabeled.get())
+        relative_sd = None
+        if self.varRelativeSD.get().strip():
+            try:
+                relative_sd = float(self.varRelativeSD.get()) / 100
+            except ValueError:
+                relative_sd = -1
+            if relative_sd < 0:
+                messagebox.showerror("Error", "Measurement error should be a positive number (in %),"
+                                              " or left empty.")
+                return None
+        params['extra_options'] = {'relative_sd': relative_sd, 'absolute_sd': None,
+                                   'unconstrained': bool(self.chVarUnconstrained.get())}
         return params
 
     def process(self, params):
@@ -458,6 +474,13 @@ class GUIinterface(ttk.Frame):
         useformula = params['useformula']
         input_file = params['input_file']
         self.baseenv.registerDatafile(input_file, useformula)
+        unlabeled = params['unlabeled']
+        known_samples = [i[0] for i in self.baseenv.getSamplesList()]
+        for sample in unlabeled:
+            if sample not in known_samples:
+                raise ValueError("Unlabeled sample '{}' not found in the measurements file.".format(sample))
+        extra_options = params['extra_options']
+        unlabeled_warnings = 0
         tracer = params['tracer']
         correct_NA_tracer = params['correct_NA_tracer']
         tracer_purity = params['tracer_purity']
@@ -496,6 +519,11 @@ class GUIinterface(ttk.Frame):
                     self.logger.info("         at mz: {}".format(mz_of_resolution))
             else:
                 self.logger.info("      mode: low-resolution")
+            if unlabeled:
+                self.logger.info("      unlabeled control samples: {} (tolerance: {:g})".format(
+                    unlabeled, isocordb.UNLABELED_TOLERANCE))
+            if extra_options['relative_sd']:
+                self.logger.info("      measurement errors: relative sd={}".format(extra_options['relative_sd']))
             self.logger.info("   natural abundance of isotopes")
             self.logger.info("   {}".format(data_isotopes))
             self.logger.info("   IsoCor version: {}".format(hr.__version__))
@@ -572,13 +600,16 @@ class GUIinterface(ttk.Frame):
                         self.logger.error(
                             "{} - {}: (metabolite, derivative) corrector could not be constructed.".format(serie[0], label))
 
-                    for i, line in enumerate(zip(*(serie[1], valuesCorrected[0], valuesCorrected[1], valuesCorrected[2],
-                                                   [valuesCorrected[3]] * len(valuesCorrected[0])))):
+                    if serie[0] in unlabeled:
+                        unlabeled_warnings += isocordb.check_unlabeled(self.logger, metabo, serie[0], label, serie[1])
+                    extra = isocordb.extra_values(metabo, serie[1], **extra_options)
+                    for i, line in enumerate(zip(*([serie[1], valuesCorrected[0], valuesCorrected[1], valuesCorrected[2],
+                                                    [valuesCorrected[3]] * len(valuesCorrected[0])] + extra))):
                         rows.append(line)
                         index.append((serie[0], label[0], label[1], i, isotopic_inchi[i]))
 
             # save results
-            df = results_dataframe(rows, index)
+            df = results_dataframe(rows, index, isocordb.extra_columns(**extra_options))
             out_file = params['out_file']
             df.to_csv(str(out_file), sep='\t')
 
@@ -598,6 +629,9 @@ class GUIinterface(ttk.Frame):
                     len(errors['labels'])))
                 self.logger.info("      {} errors during correction of measurements".format(len(errors['measurements'])))
                 self.logger.info("      detailed information on errors are provided above.")
+            if unlabeled:
+                self.logger.info("   unlabeled controls differing from the theoretical pattern: {}".format(
+                    unlabeled_warnings))
             self.logger.info("   results saved in: {}".format(out_file))
             self.logger.info("   log saved in: {}".format(log_file))
         finally:
@@ -792,6 +826,17 @@ class GUIinterface(ttk.Frame):
         self.mzlbl = ttk.Label(self.highResFrame, text="at m/z")
         self.mzEntry = ttk.Entry(self.highResFrame, textvariable=self.varMZ)
 
+        self.qualityFrame = ttk.LabelFrame(optionFrame, text='Quality control (optional)')
+        self.varUnlabeled = tk.StringVar()
+        self.varRelativeSD = tk.StringVar()
+        self.chVarUnconstrained = tk.IntVar()
+        self.unlabeledlbl = ttk.Label(self.qualityFrame, text="Unlabeled samples (?)")
+        self.unlabeledEntry = ttk.Entry(self.qualityFrame, textvariable=self.varUnlabeled)
+        self.relativeSDlbl = ttk.Label(self.qualityFrame, text="Measurement error, % (?)")
+        self.relativeSDEntry = ttk.Entry(self.qualityFrame, textvariable=self.varRelativeSD, width=8)
+        self.chUnconstrained = ttk.Checkbutton(
+            self.qualityFrame, text="Also report unconstrained fractions (?)", variable=self.chVarUnconstrained)
+
         self.chVarVerboseLog = tk.IntVar()
         self.chVarNatAbTracer = tk.IntVar()
         self.chVerboseLog = ttk.Checkbutton(
@@ -862,6 +907,13 @@ class GUIinterface(ttk.Frame):
         self.mzlbl.grid(column=1, row=2, sticky='NW')
         self.mzEntry.grid(column=1, row=3, sticky='NW')
         purityLblFrame.grid(column=0, row=5, sticky='NW')
+        self.qualityFrame.grid(column=0, row=5, sticky='NWE')
+        self.qualityFrame.columnconfigure(1, weight=1)
+        self.unlabeledlbl.grid(column=0, row=0, sticky='NW')
+        self.unlabeledEntry.grid(column=1, row=0, sticky='NWE')
+        self.relativeSDlbl.grid(column=0, row=1, sticky='NW')
+        self.relativeSDEntry.grid(column=1, row=1, sticky='NW')
+        self.chUnconstrained.grid(column=0, row=2, columnspan=2, sticky='NW')
         self.purityManager.grid(column=0, row=1, sticky='NW')
         self.scrollPurity.grid(column=1, row=1, sticky='NS')
         self.chNatAbTracer.grid(column=0, row=0, sticky='NW')
@@ -890,6 +942,12 @@ class GUIinterface(ttk.Frame):
                 text="Correct for the contribution of isotopic impurities of the tracer at labeled positions. The isotopic purity is typically obtained from the manufacturer.\ne.g. for \u00B9\u00B3C-substrates with purity of 99%, use 0.01 for \u00B9\u00B2C and 0.99 for \u00B9\u00B3C.")
         Tooltip(self.chVerboseLog, text="Log more details. Useful in case of trouble: attach the log file when reporting an issue on GitHub.")
         Tooltip(self.databasePathSubmit, text="Folder containing all database files.")
+        Tooltip(self.unlabeledlbl,
+                text="Names of the samples without tracer, separated by commas. Their measurements are compared to the theoretical isotopic pattern at natural abundance: a warning in the logs reveals a wrong formula (metabolite or derivative), a wrong resolution or a biased measurement, which the correction itself cannot detect.")
+        Tooltip(self.relativeSDlbl,
+                text="Relative standard deviation of the measured areas (e.g. 2 for 2 %). If provided, the standard deviations of the isotopologue fractions and of the mean enrichment are added to the results.")
+        Tooltip(self.chUnconstrained,
+                text="Corrected fractions cannot be negative, hence noise on absent isotopologues slightly biases fractions and mean enrichment upward. Check this box to add the unbiased solution (which may contain negative values) to the results.")
 
         # create texthandler and formatter to display logs
         self.scroll_handler = TextHandler(self.logstream)

@@ -147,3 +147,29 @@ def test_data_preview(gui):
                                               "area", "resolution"]
     assert len(gui.datatable.get_children()) == 87
     assert gui.inputDataEntry.xview()[1] == 1.0
+
+
+def test_quality_controls(gui, tmp_path):
+    """Unlabeled samples are checked, and optional columns are added to the results."""
+    gui.varUnlabeled.set("Sample_1, Sample_2")
+    gui.varRelativeSD.set("2")
+    gui.chVarUnconstrained.set(1)
+    gui.start_process()
+    wait_until_done(gui)
+    assert gui.dialogs == []
+    # 6 metabolites in each sample, one of them without signal (nothing to compare)
+    assert log_text(gui).count("unlabeled control,") == 10
+    header = (tmp_path / "Data_example_res.tsv").read_text().split("\n")[0].split("\t")
+    assert header[-4:] == ["isotopologue_fraction_sd", "mean_enrichment_sd",
+                           "isotopologue_fraction_unconstrained", "mean_enrichment_unconstrained"]
+
+
+def test_quality_controls_errors(gui):
+    gui.varRelativeSD.set("abc")
+    gui.start_process()
+    assert gui._thread is None and "Measurement error" in gui.dialogs[0][2]
+    gui.varRelativeSD.set("")
+    gui.varUnlabeled.set("unknown_sample")
+    gui.start_process()
+    wait_until_done(gui)
+    assert gui.dialogs[-1][0] == "showerror" and "unknown_sample" in gui.dialogs[-1][2]

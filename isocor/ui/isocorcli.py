@@ -80,6 +80,22 @@ def process(args):
                     "mz at which resolution is measured '{}' should be a positive number.".format(mz_of_resolution))
 
         baseenv.registerDatafile(Path(args.inputdata), useformula)
+
+        # optional quality controls
+        unlabeled = getattr(args, 'unlabeled', [])
+        known_samples = [i[0] for i in baseenv.getSamplesList()]
+        for sample in unlabeled:
+            if sample not in known_samples:
+                raise ValueError("Unlabeled sample '{}' not found in the measurements file.".format(sample))
+        unlabeled_tolerance = getattr(args, 'unlabeled_tolerance', isocor.ui.isocordb.UNLABELED_TOLERANCE)
+        extra_options = {'relative_sd': getattr(args, 'relative_sd', None),
+                         'absolute_sd': getattr(args, 'absolute_sd', None),
+                         'unconstrained': hasattr(args, 'unconstrained')}
+        for name in ('relative_sd', 'absolute_sd'):
+            if extra_options[name] is not None and extra_options[name] < 0:
+                raise ValueError("'{}' should be a positive number.".format(name))
+        if unlabeled_tolerance <= 0:
+            raise ValueError("'unlabeled_tolerance' should be a positive number.")
     except Exception as err:
         logger.error(
             "wrong parameters. Check for errors above. {}".format(err))
@@ -113,12 +129,18 @@ def process(args):
             logger.info("         at mz: {}".format(mz_of_resolution))
     else:
         logger.info("      mode: low-resolution")
+    if unlabeled:
+        logger.info("      unlabeled control samples: {} (tolerance: {:g})".format(unlabeled, unlabeled_tolerance))
+    if extra_options['relative_sd'] or extra_options['absolute_sd']:
+        logger.info("      measurement errors: relative sd={}, absolute sd={}".format(
+            extra_options['relative_sd'] or 0., extra_options['absolute_sd'] or 0.))
     logger.info("   natural abundance of isotopes")
     logger.info("   {}".format(data_isotopes))
     logger.info("   IsoCor version: {}".format(hr.__version__))
 
     # initialize error dict
     errors = {'labels': [], 'measurements': []}
+    unlabeled_warnings = 0
 
     labels = baseenv.getLabelsList(useformula)
     logger.info('------------------------------------------------')
@@ -183,10 +205,14 @@ def process(args):
                     ["{} - {}".format(serie[0], label)]
                 logger.error(
                     "{} - {}: (metabolite, derivative) corrector could not be constructed.".format(serie[0], label))
-            for i, line in enumerate(zip(*(serie[1], valuesCorrected[0], valuesCorrected[1], valuesCorrected[2], [valuesCorrected[3]]*len(valuesCorrected[0])))):
+            if serie[0] in unlabeled:
+                unlabeled_warnings += isocor.ui.isocordb.check_unlabeled(
+                    logger, metabo, serie[0], label, serie[1], unlabeled_tolerance)
+            extra = isocor.ui.isocordb.extra_values(metabo, serie[1], **extra_options)
+            for i, line in enumerate(zip(*([serie[1], valuesCorrected[0], valuesCorrected[1], valuesCorrected[2], [valuesCorrected[3]]*len(valuesCorrected[0])] + extra))):
                 rows.append(line)
                 index.append((serie[0], label[0], label[1], i, isotopic_inchi[i]))
-    df = isocor.ui.isocordb.results_dataframe(rows, index)
+    df = isocor.ui.isocordb.results_dataframe(rows, index, isocor.ui.isocordb.extra_columns(**extra_options))
 
     # summary results for logs
     logger.info('------------------------------------------------')
@@ -208,6 +234,8 @@ def process(args):
         logger.info("      {} errors during correction of measurements".format(
             len(errors['measurements'])))
         logger.info("      detailed information on errors are provided above.")
+    if unlabeled:
+        logger.info("   unlabeled controls differing from the theoretical pattern: {}".format(unlabeled_warnings))
 
     output = io.StringIO()
     df.to_csv(output, sep='\t')
@@ -236,6 +264,20 @@ def parseArgs():
                         help="purity vector of the tracer")
     parser.add_argument("-n", "--correct_NA_tracer",
                         help="flag to correct tracer natural abundance", action='store_true')
+    parser.add_argument("-u", "--unlabeled", type=isocor.ui.isocordb.parse_samples,
+                        help='names of the unlabeled control samples, separated by commas (e.g. "ctrl_1,ctrl_2"): '
+                             'their measurements are compared to the theoretical isotopic pattern')
+    parser.add_argument("--unlabeled_tolerance", type=float,
+                        help="tolerance on the fractions of the peaks of unlabeled samples (default: {})".format(
+                            isocor.ui.isocordb.UNLABELED_TOLERANCE))
+    parser.add_argument("--relative_sd", type=float,
+                        help='relative standard deviation of the measured areas (e.g. "0.02" for 2 %%), '
+                             'to calculate the standard deviation of the corrected values')
+    parser.add_argument("--absolute_sd", type=float,
+                        help="absolute standard deviation of the measured areas (same unit as areas)")
+    parser.add_argument("--unconstrained",
+                        help="flag to also report the isotopologue fractions without the non-negativity constraint",
+                        action='store_true')
     parser.add_argument("-v", "--verbose",
                         help="flag to enable verbose logs", action='store_true')
     return parser
