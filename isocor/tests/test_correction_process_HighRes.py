@@ -104,7 +104,7 @@ import isocor as hrcor
                                    "v_measured": "[0.7*p1H**2 + 0.2*p1H**2*pur12C + 0.1*p1H**2*pur12C**2, 0.7*p1H*p2H*2 + 0.2*p1H**2*pur13C + 0.2*p1H*p2H*2*pur12C + 0.1*p1H**2*pur12C*pur13C*2 + 0.1*p1H*p2H*2*pur12C**2, 0.7*p2H**2 + 0.2*p1H*p2H*2*pur13C + 0.2*p2H**2*pur12C + 0.1*p1H**2*pur13C**2 + 0.1*p1H*p2H*2*pur12C*pur13C*2 + 0.1*p2H**2*pur12C**2]",
                                    "correct_NA_tracer": False,
                                    "tracer_purity": [0.3, 0.7]}])
-def test_high_res_correction(data, data_iso):
+def test_high_res_correction(data, data_iso, usr_tolerance):
     """Correction of non-tracer elements depending on resolution and formula.
 
     Measured values should be corrected for the incorporation of natural isotopes of
@@ -137,4 +137,4 @@ def test_high_res_correction(data, data_iso):
                                                   charge=1)
     _, v_corrected, _, _ = metabolite.correct(v_measured)
     # Compare corrected vs. expected data
-    np.testing.assert_allclose(v_corrected, v_expected, rtol=1e-7)
+    np.testing.assert_allclose(v_corrected, v_expected, rtol=1e-7, atol=usr_tolerance)

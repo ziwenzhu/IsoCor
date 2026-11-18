@@ -188,6 +188,8 @@ class EnvComputing(object):
             self._stripCol(self.dfDatafile, ['sample', 'metabolite', 'derivative', 'resolution'])
             self._groupbyDatafile = self.dfDatafile.groupby(
                 by=['metabolite', 'derivative', 'resolution', 'sample'])
+        # measurements of each label, built at first use (see getDataSerie)
+        self._dataSeries = None
 
     def getLabelsList(self, useformula):
         if useformula:
@@ -246,18 +248,23 @@ class EnvComputing(object):
             return tupleNames[0]
 
     def getDataSerie(self, tupleNames, useformula):
-        l, l_err = [], []
         if useformula:
             length = 2
         else:
             length = 3
-        for i, j in self._groupbyDatafile:
-            if i[:length] == tupleNames:
-                try:
-                    p = j.sort_values(by=['isotopologue'])
-                    l.append([i[length], list(p.area.values)])
-                except:
-                    l_err.append(i[length])
+        if self._dataSeries is None:
+            # group the measurements by label in a single pass over the data (in the order of
+            # the groups, i.e. sorted by sample), instead of scanning all the groups for each label
+            self._dataSeries = {}
+            for i, j in self._groupbyDatafile:
+                self._dataSeries.setdefault(i[:length], []).append((i, j))
+        l, l_err = [], []
+        for i, j in self._dataSeries.get(tuple(tupleNames), []):
+            try:
+                p = j.sort_values(by=['isotopologue'])
+                l.append([i[length], list(p.area.values)])
+            except:
+                l_err.append(i[length])
         return l, l_err
 
 

@@ -12,7 +12,7 @@ import itertools as it
 import logging
 from decimal import Decimal as D
 import numpy as np
-from scipy.optimize import fmin_l_bfgs_b
+from scipy.optimize import fmin_l_bfgs_b, nnls
 from isocor.base import LabelledChemical, InterfaceMSCorrector
 
 logger = logging.getLogger(__name__)
@@ -190,7 +190,7 @@ class LowResMetaboliteCorrector(LabelledChemical, InterfaceMSCorrector):
                      self.label, measurement)
         self._check_measurement(measurement)
         # Perform the actual correction
-        corrected_area, iso_fraction, residuum, enrichment = self._correct_with_bfgs(
+        corrected_area, iso_fraction, residuum, enrichment = self._correct_with_nnls(
             measurement)
         logger.debug(
             "Finished correction. Residuum (normalized to 1): %s", residuum)
@@ -335,14 +335,12 @@ class LowResMetaboliteCorrector(LabelledChemical, InterfaceMSCorrector):
         # calculate sum of square differences and gradient
         return (np.dot(x, x), np.dot(mat_cor.transpose(), x)*-2)
 
-    def _correct_with_bfgs(self, measurement):
-        """Perform the correction of the measurement vector using a L-BFGS-B algorithm.
+    def _solve_with_bfgs(self, v_mes):
+        """Return the non-negative least squares solution using a L-BFGS-B algorithm (approximate).
 
         Args:
-            measurement (list): measurement vector
+            v_mes (array): measurement vector
         """
-        # perform correction and calculate residuum
-        v_mes = np.array(measurement).transpose()
         length_result = self.formula[self._tracer_el] + 1
         corrected_area, _, _ = fmin_l_bfgs_b(self._get_cost_function,
                                              np.zeros(length_result),
@@ -353,6 +351,24 @@ class LowResMetaboliteCorrector(LabelledChemical, InterfaceMSCorrector):
                                              factr=1000,
                                              pgtol=1e-10,
                                              bounds=[(0., float('inf'))] * length_result)
+        return corrected_area
+
+    def _correct_with_nnls(self, measurement):
+        """Perform the correction of the measurement vector by non-negative least squares.
+
+        The exact solution is computed with scipy.optimize.nnls (active-set algorithm);
+        the L-BFGS-B algorithm is used if nnls does not converge.
+
+        Args:
+            measurement (list): measurement vector
+        """
+        # perform correction and calculate residuum
+        v_mes = np.array(measurement, dtype=float)
+        try:
+            corrected_area, _ = nnls(self.correction_matrix, v_mes)
+        except RuntimeError as err:
+            logger.debug("nnls did not converge for %s (%s), using L-BFGS-B.", self.label, err)
+            corrected_area = self._solve_with_bfgs(v_mes)
         resi = v_mes - np.dot(self.correction_matrix, corrected_area)
         # normalize mid and residuum
         sum_p = math.fsum(corrected_area)

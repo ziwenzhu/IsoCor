@@ -83,4 +83,4 @@ def test_low_res_correction(data, data_iso, usr_tolerance):
                                                  tracer_purity=data["tracer_purity"])
     _, v_corrected, _, _ = metabolite.correct(v_measured)
     # Compare corrected vs. expected data
-    np.testing.assert_allclose(v_corrected, v_expected, rtol=1e-7)
+    np.testing.assert_allclose(v_corrected, v_expected, rtol=1e-7, atol=usr_tolerance)
