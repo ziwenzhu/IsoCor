@@ -16,7 +16,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: [ '3.8', '3.9', '3.10', '3.11','3.12', '3.13', '3.14' ]
+        python-version: [ '3.8', '3.9', '3.10', '3.11','3.12', '3.13', '3.14', '3.15' ]
 
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +25,8 @@ jobs:
         with:
           python-version: ${{matrix.python-version}}
           architecture: x64
+          # use a pre-release when the version is not released yet (e.g. 3.15)
+          allow-prereleases: true
       - name: Install Dependencies
         run:
           python -m pip install --upgrade pip &&
